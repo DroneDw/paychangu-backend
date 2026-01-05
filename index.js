@@ -19,14 +19,14 @@ app.post("/pay", async (req, res) => {
     console.log(`[PAY] Calling PayChangu API...`, { amount, phone, network, paymentRef });
 
     const payResponse = await axios.post(
-      "https://api.paychangu.com/payment", // ✅ FIXED: removed space
+      "https://api.paychangu.com/payment",
       {
         amount,
         currency: "MWK",
         phone_number: phone,
         network,
         reference: paymentRef,
-        callback_url: "https://paychangu-backend-g9vt.onrender.com/webhook" // ✅ FIXED: removed space
+        callback_url: "https://paychangu-backend-g9vt.onrender.com/webhook"
       },
       {
         headers: {
@@ -38,7 +38,10 @@ app.post("/pay", async (req, res) => {
 
     console.log(`[PAY] PayChangu Response:`, JSON.stringify(payResponse.data, null, 2));
 
-    if (!payResponse.data?.checkout_url) {
+    // ✅ FIXED: Access nested data structure
+    const checkoutUrl = payResponse.data?.data?.checkout_url;
+
+    if (!checkoutUrl) {
       console.error(`[PAY ERROR] No checkout_url! Response:`, payResponse.data);
       throw new Error(`PayChangu API returned error: ${JSON.stringify(payResponse.data)}`);
     }
@@ -55,7 +58,7 @@ app.post("/pay", async (req, res) => {
 
     res.json({
       paymentId: paymentRef,
-      checkoutUrl: payResponse.data.checkout_url
+      checkoutUrl: checkoutUrl
     });
 
   } catch (error) {
