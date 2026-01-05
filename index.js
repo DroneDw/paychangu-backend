@@ -25,7 +25,7 @@ app.post("/pay", async (req, res) => {
         phone_number: phone,
         network,
         reference: paymentRef,
-        callback_url: "https://YOUR_RENDER_URL/webhook"
+        callback_url: "https://paychangu-backend-g9vt.onrender.com/webhook"
       },
       {
         headers: {
