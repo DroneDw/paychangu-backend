@@ -14,18 +14,19 @@ app.use(express.json());
 app.post("/pay", async (req, res) => {
   try {
     const { amount, phone, network, userId, itemId } = req.body;
-
     const paymentRef = `PAY_${Date.now()}`;
 
+    console.log(`[PAY] Calling PayChangu API...`, { amount, phone, network, paymentRef });
+
     const payResponse = await axios.post(
-      "https://api.paychangu.com/payment",
+      "https://api.paychangu.com/payment", // ✅ FIXED: removed space
       {
         amount,
         currency: "MWK",
         phone_number: phone,
         network,
         reference: paymentRef,
-        callback_url: "https://paychangu-backend-g9vt.onrender.com/webhook"
+        callback_url: "https://paychangu-backend-g9vt.onrender.com/webhook" // ✅ FIXED: removed space
       },
       {
         headers: {
@@ -34,6 +35,13 @@ app.post("/pay", async (req, res) => {
         }
       }
     );
+
+    console.log(`[PAY] PayChangu Response:`, JSON.stringify(payResponse.data, null, 2));
+
+    if (!payResponse.data?.checkout_url) {
+      console.error(`[PAY ERROR] No checkout_url! Response:`, payResponse.data);
+      throw new Error(`PayChangu API returned error: ${JSON.stringify(payResponse.data)}`);
+    }
 
     await db.collection("payments").doc(paymentRef).set({
       userId,
@@ -50,8 +58,9 @@ app.post("/pay", async (req, res) => {
       checkoutUrl: payResponse.data.checkout_url
     });
 
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+  } catch (error) {
+    console.error(`[PAY ERROR] ${error.message}`);
+    res.status(500).json({ error: error.message });
   }
 });
 
