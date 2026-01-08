@@ -16,7 +16,12 @@ app.post("/pay", async (req, res) => {
     const { amount, phone, network, userId, itemId } = req.body;
     const paymentRef = `PAY_${Date.now()}`;
 
-    console.log(`[PAY] Calling PayChangu API...`, { amount, phone, network, paymentRef });
+    console.log(`[PAY] Calling PayChangu API...`, {
+      amount,
+      phone,
+      network,
+      paymentRef
+    });
 
     const payResponse = await axios.post(
       "https://api.paychangu.com/payment",
@@ -36,14 +41,16 @@ app.post("/pay", async (req, res) => {
       }
     );
 
-    console.log(`[PAY] PayChangu Response:`, JSON.stringify(payResponse.data, null, 2));
+    console.log(
+      `[PAY] PayChangu Response:`,
+      JSON.stringify(payResponse.data, null, 2)
+    );
 
-    // ✅ FIXED: Access nested data structure
     const checkoutUrl = payResponse.data?.data?.checkout_url;
 
     if (!checkoutUrl) {
-      console.error(`[PAY ERROR] No checkout_url! Response:`, payResponse.data);
-      throw new Error(`PayChangu API returned error: ${JSON.stringify(payResponse.data)}`);
+      console.error("[PAY ERROR] No checkout_url!");
+      throw new Error("Missing checkout_url from PayChangu");
     }
 
     await db.collection("payments").doc(paymentRef).set({
@@ -58,26 +65,56 @@ app.post("/pay", async (req, res) => {
 
     res.json({
       paymentId: paymentRef,
-      checkoutUrl: checkoutUrl
+      checkoutUrl
     });
-
   } catch (error) {
-    console.error(`[PAY ERROR] ${error.message}`);
+    console.error("[PAY ERROR]", error.message);
     res.status(500).json({ error: error.message });
   }
 });
 
-/* ---------------- WEBHOOK ---------------- */
+/* ---------------- WEBHOOK (UPGRADED – DEBUG FIRST) ---------------- */
 app.post("/webhook", async (req, res) => {
-  const { reference, status } = req.body;
+  console.log("🔥 WEBHOOK HIT 🔥");
+  console.log(JSON.stringify(req.body, null, 2));
 
-  if (!reference) return res.sendStatus(400);
+  try {
+    const data = req.body?.data || {};
+    const event = req.body?.event;
 
-  await db.collection("payments").doc(reference).update({
-    status
-  });
+    // PayChangu may send reference in different fields
+    const reference =
+      data.reference ||
+      data.tx_ref ||
+      data.payment_ref ||
+      req.body.reference;
 
-  res.sendStatus(200);
+    const status =
+      data.status ||
+      req.body.status ||
+      (event && event.includes("success") ? "SUCCESS" : null);
+
+    if (!reference) {
+      console.error("[WEBHOOK] No reference found");
+      return res.sendStatus(400);
+    }
+
+    if (!status) {
+      console.error("[WEBHOOK] No status found");
+      return res.sendStatus(400);
+    }
+
+    await db.collection("payments").doc(reference).update({
+      status,
+      updatedAt: new Date()
+    });
+
+    console.log(`[WEBHOOK] Payment ${reference} updated to ${status}`);
+    res.sendStatus(200);
+  } catch (err) {
+    console.error("[WEBHOOK ERROR]", err.message);
+    res.sendStatus(500);
+  }
 });
 
 /* ---------------- STATUS CHECK ---------------- */
@@ -87,6 +124,6 @@ app.get("/payment-status/:id", async (req, res) => {
   res.json(doc.data());
 });
 
-app.listen(process.env.PORT, () =>
-  console.log("Server running on port", process.env.PORT)
-);
+app.listen(process.env.PORT, () => {
+  console.log("Server running on port", process.env.PORT);
+});
