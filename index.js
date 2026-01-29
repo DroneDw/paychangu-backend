@@ -82,9 +82,8 @@ app.post("/webhook", async (req, res) => {
       payload.payment_ref ||
       req.body.reference;
 
-    const status =
-      payload.status ||
-      (event.toLowerCase().includes("success") ? "SUCCESS" : null);
+    const status = payload.status === "success" ? "SUCCESS" : "FAILED";
+
 
     if (!reference || !status) {
       console.error("[WEBHOOK] Missing reference or status");
