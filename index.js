@@ -12,7 +12,6 @@ const app = express();
 /* ---------------------------------------------------
    MIDDLEWARE
 --------------------------------------------------- */
-
 // Capture RAW body for webhook signature verification
 app.use(
   express.json({
@@ -46,13 +45,8 @@ app.post("/pay", async (req, res) => {
         phone_number: phone,
         network,
         reference: paymentRef,
-        callback_url: "https://paychangu-backend-g9vt.onrender.com/webhook",
-
-        // ✅ FIX: send userId and itemId in metadata
-        meta: {
-          userId,
-          itemId
-        }
+        callback_url: `${process.env.BACKEND_URL}/webhook`,
+        meta: { userId, itemId } // ✅ include metadata
       },
       {
         headers: {
@@ -63,10 +57,9 @@ app.post("/pay", async (req, res) => {
     );
 
     const checkoutUrl = payResponse?.data?.data?.checkout_url;
-    if (!checkoutUrl) {
-      throw new Error("Checkout URL missing from PayChangu");
-    }
+    if (!checkoutUrl) throw new Error("Checkout URL missing from PayChangu");
 
+    // Store payment in Firestore
     await db.collection("payments").doc(paymentRef).set({
       userId,
       itemId,
@@ -107,7 +100,6 @@ app.post("/webhook", async (req, res) => {
         console.error("[WEBHOOK] ❌ Invalid signature");
         return res.sendStatus(401);
       }
-
       console.log("[WEBHOOK] ✅ Signature verified");
     } else {
       console.log("[WEBHOOK] ℹ️ No signature provided by PayChangu");
@@ -130,10 +122,9 @@ app.post("/webhook", async (req, res) => {
 
       let payment;
 
-      // ✅ CREATE PAYMENT IF MISSING
+      // ✅ Create payment if missing
       if (!snap.exists) {
         console.log(`[WEBHOOK] ℹ️ Creating missing payment ${reference}`);
-
         payment = {
           userId: payload.meta?.userId,
           itemId: payload.meta?.itemId,
@@ -153,17 +144,19 @@ app.post("/webhook", async (req, res) => {
         payment = snap.data();
       }
 
-      // ✅ IDEMPOTENCY CHECK
+      // ✅ Idempotency: stop if ticket already created
       if (payment.ticketCreated) {
         console.log(`[WEBHOOK] ℹ️ Already processed: ${reference}`);
         return;
       }
 
+      // Update payment status
       transaction.update(paymentDoc, {
         status,
         updatedAt: admin.firestore.FieldValue.serverTimestamp()
       });
 
+      // ✅ Create ticket if payment successful
       if (status === "SUCCESS") {
         const [eventId, ticketTypeId] = payment.itemId.split("_");
         const ticketId = `TICKET_${reference}`;
@@ -199,9 +192,7 @@ app.post("/webhook", async (req, res) => {
 app.get("/payment-success", async (req, res) => {
   const reference = req.query.reference || req.query.tx_ref;
 
-  if (!reference) {
-    return res.send("<h2>❌ Invalid reference</h2>");
-  }
+  if (!reference) return res.send("<h2>❌ Invalid reference</h2>");
 
   try {
     const snap = await db.collection("payments").doc(reference).get();
@@ -248,9 +239,14 @@ app.get("/payment-status/:id", async (req, res) => {
 });
 
 /* ---------------------------------------------------
+   HEALTH CHECK
+--------------------------------------------------- */
+app.get("/", (req, res) => res.send("PayChangu Backend Running"));
+
+/* ---------------------------------------------------
    SERVER
 --------------------------------------------------- */
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
-  console.log("🚀 Server running on port", PORT);
+  console.log(`🚀 Server running on port ${PORT}`);
 });
