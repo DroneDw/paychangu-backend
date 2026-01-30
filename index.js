@@ -82,7 +82,7 @@ app.post("/pay", async (req, res) => {
 });
 
 /* ---------------------------------------------------
-   WEBHOOK
+   WEBHOOK (FIXED)
 --------------------------------------------------- */
 app.post("/webhook", async (req, res) => {
   console.log("[WEBHOOK] Received");
@@ -108,7 +108,7 @@ app.post("/webhook", async (req, res) => {
       console.log("[WEBHOOK] ℹ️ No signature provided by PayChangu");
     }
 
-    /* -------- PAYLOAD HANDLING -------- */
+    /* -------- PAYLOAD -------- */
     const payload = req.body;
     const reference = payload.tx_ref || payload.reference;
     const status = payload.status === "success" ? "SUCCESS" : "FAILED";
@@ -120,24 +120,38 @@ app.post("/webhook", async (req, res) => {
 
     console.log(`[WEBHOOK] Ref=${reference} Status=${status}`);
 
-    /* -------- ATOMIC TRANSACTION -------- */
+    /* -------- TRANSACTION -------- */
     await db.runTransaction(async (transaction) => {
-      const paymentRef = db.collection("payments").doc(reference);
-      const snap = await transaction.get(paymentRef);
+      const paymentDoc = db.collection("payments").doc(reference);
+      const snap = await transaction.get(paymentDoc);
 
+      let payment;
+
+      // ✅ CREATE PAYMENT IF IT DOES NOT EXIST
       if (!snap.exists) {
-        console.error(`[WEBHOOK] ❌ Payment not found: ${reference}`);
-        return;
+        console.log(`[WEBHOOK] ℹ️ Creating missing payment ${reference}`);
+
+        payment = {
+          userId: payload.user_id || "unknown",
+          itemId: payload.metadata?.itemId || "unknown_unknown",
+          amount: payload.amount || 0,
+          status,
+          ticketCreated: false,
+          createdAt: admin.firestore.FieldValue.serverTimestamp()
+        };
+
+        transaction.set(paymentDoc, payment);
+      } else {
+        payment = snap.data();
       }
 
-      const payment = snap.data();
-
+      // ✅ IDEMPOTENCY CHECK
       if (payment.ticketCreated) {
         console.log(`[WEBHOOK] ℹ️ Already processed: ${reference}`);
         return;
       }
 
-      transaction.update(paymentRef, {
+      transaction.update(paymentDoc, {
         status,
         updatedAt: admin.firestore.FieldValue.serverTimestamp()
       });
@@ -157,7 +171,7 @@ app.post("/webhook", async (req, res) => {
           createdAt: admin.firestore.FieldValue.serverTimestamp()
         });
 
-        transaction.update(paymentRef, { ticketCreated: true });
+        transaction.update(paymentDoc, { ticketCreated: true });
         console.log(`[WEBHOOK] ✅ Ticket created: ${ticketId}`);
       } else {
         console.log(`[WEBHOOK] ❌ Payment failed: ${reference}`);
