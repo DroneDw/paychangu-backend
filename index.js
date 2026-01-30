@@ -122,6 +122,8 @@ app.post("/webhook", async (req, res) => {
 
     await db.runTransaction(async (transaction) => {
       const paymentDoc = db.collection("payments").doc(paymentRef);
+
+      // ✅ STEP 1: READ PAYMENT FIRST
       const snap = await transaction.get(paymentDoc);
 
       if (!snap.exists) {
@@ -136,26 +138,21 @@ app.post("/webhook", async (req, res) => {
         return;
       }
 
-      transaction.update(paymentDoc, {
-        status,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp()
-      });
+      const [eventId, ticketTypeId] = payment.itemId.split("_");
+      const eventRef = db.collection("events_balaka").doc(eventId);
 
-      if (status === "SUCCESS") {
-        const [eventId, ticketTypeId] = payment.itemId.split("_");
+      // ✅ STEP 2: READ EVENT BEFORE ANY WRITES
+      let eventName = "Event";
+      let ticketTypeName = "Ticket";
+      let updatedTicketTypes = null;
 
-        // ✅ FETCH EVENT DETAILS FOR BEAUTIFUL TICKET DISPLAY
-        let eventName = "Event";
-        let ticketTypeName = "Ticket";
-
-        const eventRef = db.collection("events_balaka").doc(eventId);
+      try {
         const eventSnap = await transaction.get(eventRef);
-
         if (eventSnap.exists) {
           const eventData = eventSnap.data();
           eventName = eventData?.title || eventData?.name || "Event";
 
-          // Find ticket type name from the array and update counts
+          // Find ticket type and calculate new availability
           const ticketTypes = eventData?.ticketTypes || [];
           const ticketTypeIndex = ticketTypes.findIndex(t => t.id === ticketTypeId);
 
@@ -163,45 +160,59 @@ app.post("/webhook", async (req, res) => {
             const ticketType = ticketTypes[ticketTypeIndex];
             ticketTypeName = ticketType.name || "Ticket";
 
-            // ✅ UPDATE AVAILABLE COUNT (FIXED)
+            // Calculate new counts
             const currentSold = ticketType.sold || 0;
             const currentQty = ticketType.quantity || 0;
             const newSold = currentSold + 1;
             const newAvailable = Math.max(0, currentQty - newSold);
 
-            const updatedTicketTypes = [...ticketTypes];
+            // Prepare updated array
+            updatedTicketTypes = [...ticketTypes];
             updatedTicketTypes[ticketTypeIndex] = {
               ...ticketType,
               sold: newSold,
               available: newAvailable
             };
 
-            transaction.update(eventRef, {
-              ticketTypes: updatedTicketTypes
-            });
-
-            console.log(`[WEBHOOK] Updated ${ticketTypeName}: sold=${newSold}, available=${newAvailable}`);
+            console.log(`[WEBHOOK] Will update ${ticketTypeName}: sold=${newSold}, available=${newAvailable}`);
           }
         }
-
-        const ticketId = `TICKET_${paymentRef}`;
-
-        transaction.set(db.collection("tickets").doc(ticketId), {
-          id: ticketId,
-          userId: payment.userId,
-          eventId,
-          eventName,        // ✅ Human-readable event name
-          ticketTypeId,
-          ticketTypeName,   // ✅ Human-readable ticket type name
-          paymentId: paymentRef,
-          status: "active",
-          qrCode: ticketId,
-          createdAt: admin.firestore.FieldValue.serverTimestamp()
-        });
-
-        transaction.update(paymentDoc, { ticketCreated: true });
-        console.log(`[WEBHOOK] ✅ Ticket created: ${ticketId} for ${eventName}`);
+      } catch (e) {
+        console.log("[WEBHOOK] Could not fetch event details, using defaults");
       }
+
+      const ticketId = `TICKET_${paymentRef}`;
+
+      // ✅ STEP 3: ALL WRITES (NO READS AFTER THIS POINT)
+
+      transaction.update(paymentDoc, {
+        status,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+
+      transaction.set(db.collection("tickets").doc(ticketId), {
+        id: ticketId,
+        userId: payment.userId,
+        eventId,
+        eventName,        // ✅ Human-readable event name
+        ticketTypeId,
+        ticketTypeName,   // ✅ Human-readable ticket type name
+        paymentId: paymentRef,
+        status: "active",
+        qrCode: ticketId,
+        createdAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+
+      transaction.update(paymentDoc, { ticketCreated: true });
+
+      // Update event ticket counts if found
+      if (updatedTicketTypes) {
+        transaction.update(eventRef, {
+          ticketTypes: updatedTicketTypes
+        });
+      }
+
+      console.log(`[WEBHOOK] ✅ Ticket created: ${ticketId} for ${eventName}`);
     });
 
     res.sendStatus(200);
