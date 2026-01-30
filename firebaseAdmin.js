@@ -1,22 +1,23 @@
 import admin from "firebase-admin";
+import fs from "fs";
 
-const required = ['FIREBASE_PROJECT_ID', 'FIREBASE_CLIENT_EMAIL', 'FIREBASE_PRIVATE_KEY'];
-const missing = required.filter(key => !process.env[key]);
+// Read from Secret File (Render mounts these to /etc/secrets/ or root)
+const serviceAccountPath = "./mybalaka-7830b-firebase-adminsdk-fbsvc-bc85ef4eff.json";
 
-if (missing.length > 0) {
-  console.error("❌ CRITICAL MISSING ENV VARS:", missing);
-  console.error("Add these in Render Dashboard → Environment");
+let serviceAccount;
+
+try {
+  const fileContent = fs.readFileSync(serviceAccountPath, "utf8");
+  serviceAccount = JSON.parse(fileContent);
+  console.log("✅ Loaded Firebase credentials from file");
+} catch (err) {
+  console.error("❌ Failed to read Firebase JSON file:", err.message);
+  console.error("Make sure the file is uploaded in Secret Files section");
   process.exit(1);
 }
 
 if (!admin.apps.length) {
   try {
-    const serviceAccount = {
-      projectId: process.env.FIREBASE_PROJECT_ID,
-      clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-      privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n"),
-    };
-
     admin.initializeApp({
       credential: admin.credential.cert(serviceAccount),
     });
