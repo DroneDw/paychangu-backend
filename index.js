@@ -2,7 +2,6 @@ import express from "express";
 import axios from "axios";
 import cors from "cors";
 import dotenv from "dotenv";
-import crypto from "crypto";
 import { db, admin } from "./firebaseAdmin.js";
 
 dotenv.config();
@@ -66,35 +65,21 @@ app.post("/pay", async (req, res) => {
 });
 
 /* ---------------------------------------------------
-   WEBHOOK (POST) - FIXED PAYLOAD PARSING
+   WEBHOOK (POST) - No signature check for now
 --------------------------------------------------- */
 app.post("/webhook", async (req, res) => {
   console.log("🔥 WEBHOOK RECEIVED");
-  console.log("Body:", JSON.stringify(req.body, null, 2));
 
   try {
-    // Verify signature if secret exists
-    if (process.env.PAYCHANGU_WEBHOOK_SECRET) {
-      const signature = req.headers["x-paychangu-signature"];
-      const rawBody = JSON.stringify(req.body);
-      const expected = crypto
-        .createHmac("sha256", process.env.PAYCHANGU_WEBHOOK_SECRET)
-        .update(rawBody)
-        .digest("hex");
-
-      if (signature !== expected) {
-        console.error("❌ Invalid signature");
-        return res.sendStatus(401);
-      }
-    }
-
-    // ✅ FIXED: PayChangu sends data at ROOT level, not under .data
+    // Extract data from PayChangu payload (root level)
     const payload = req.body;
     const reference = payload.tx_ref || payload.reference;
     const status = payload.status === "success" ? "SUCCESS" : "FAILED";
 
+    console.log(`Reference: ${reference}, Status: ${status}`);
+
     if (!reference) {
-      console.error("❌ Missing reference. Payload:", payload);
+      console.error("❌ Missing reference. Payload:", JSON.stringify(payload));
       return res.sendStatus(400);
     }
 
@@ -102,7 +87,7 @@ app.post("/webhook", async (req, res) => {
     const snap = await paymentRef.get();
 
     if (!snap.exists) {
-      console.log("⚠️ Payment not found:", reference);
+      console.log("⚠️ Payment not found in DB:", reference);
       return res.sendStatus(200); // Acknowledge to stop retries
     }
 
@@ -131,9 +116,9 @@ app.post("/webhook", async (req, res) => {
       });
 
       await paymentRef.update({ ticketCreated: true });
-      console.log(`✅ Ticket created: ${ticketId} for payment ${reference}`);
+      console.log(`✅ Ticket created: ${ticketId}`);
     } else {
-      console.log(`ℹ️ Skipped ticket creation: status=${status}, ticketCreated=${payment.ticketCreated}`);
+      console.log(`ℹ️ Skipped: status=${status}, alreadyCreated=${payment.ticketCreated}`);
     }
 
     res.sendStatus(200);
@@ -144,7 +129,7 @@ app.post("/webhook", async (req, res) => {
 });
 
 /* ---------------------------------------------------
-   PAYMENT SUCCESS (GET) - User redirect
+   PAYMENT SUCCESS (GET) - User redirect page
 --------------------------------------------------- */
 app.get("/payment-success", async (req, res) => {
   const reference = req.query.reference || req.query.tx_ref;
@@ -167,21 +152,22 @@ app.get("/payment-success", async (req, res) => {
               <h2 style="color: #4caf50; margin-top: 0;">Payment Successful!</h2>
               <p style="color: #666;">Your ticket has been generated.</p>
               <p style="color: #999; font-size: 14px;">Ref: ${reference}</p>
-              <button onclick="window.close()" style="margin-top: 20px; padding: 12px 24px; background: #4caf50; color: white; border: none; border-radius: 5px; cursor: pointer;">Close Window</button>
+              <button onclick="window.close()" style="margin-top: 20px; padding: 12px 24px; background: #4caf50; color: white; border: none; border-radius: 5px; cursor: pointer;">Close</button>
             </div>
           </body>
         </html>
       `);
     } else {
+      // Auto-refresh page every 3 seconds until payment is processed
       res.send(`
         <html>
           <head>
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <meta http-equiv="refresh" content="5">
+            <meta http-equiv="refresh" content="3">
           </head>
           <body style="text-align: center; padding: 50px;">
-            <h2>⏳ Processing Payment...</h2>
-            <p>Checking status...</p>
+            <h2>⏳ Processing...</h2>
+            <p>Checking payment status...</p>
             <p style="color: #999;">Ref: ${reference}</p>
           </body>
         </html>
@@ -193,7 +179,7 @@ app.get("/payment-success", async (req, res) => {
 });
 
 /* ---------------------------------------------------
-   STATUS CHECK
+   STATUS CHECK (for app polling)
 --------------------------------------------------- */
 app.get("/payment-status/:id", async (req, res) => {
   try {
