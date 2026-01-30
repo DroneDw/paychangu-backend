@@ -33,7 +33,9 @@ app.post("/pay", async (req, res) => {
         phone_number: phone,
         network,
         reference: paymentRef,
-        callback_url: "https://paychangu-backend-g9vt.onrender.com/webhook"
+
+        // ✅ USER REDIRECT (NOT WEBHOOK)
+        callback_url: "https://paychangu-backend-g9vt.onrender.com/payment-success"
       },
       {
         headers: {
@@ -67,13 +69,14 @@ app.post("/pay", async (req, res) => {
 });
 
 /* ---------------------------------------------------
-   WEBHOOK (POST) - PAYCHANGU SERVER
+   WEBHOOK (POST) - PAYCHANGU SERVER → SERVER
 --------------------------------------------------- */
 app.post("/webhook", async (req, res) => {
-  console.log("🔥 WEBHOOK RECEIVED");
+  console.log("🔥 WEBHOOK POST RECEIVED");
+  console.log(JSON.stringify(req.body, null, 2));
 
   try {
-    /* ---------------- SIGNATURE VERIFY ---------------- */
+    /* -------- SIGNATURE VERIFICATION -------- */
     const signature = req.headers["x-paychangu-signature"];
     const rawBody = JSON.stringify(req.body);
 
@@ -87,7 +90,7 @@ app.post("/webhook", async (req, res) => {
       return res.sendStatus(401);
     }
 
-    /* ---------------- DATA PARSE ---------------- */
+    /* -------- PAYLOAD PARSE -------- */
     const payload = req.body?.data || {};
     const reference =
       payload.reference ||
@@ -110,11 +113,13 @@ app.post("/webhook", async (req, res) => {
 
       const payment = snap.data();
 
+      // Always update status
       tx.update(paymentRef, {
         status,
         updatedAt: admin.firestore.FieldValue.serverTimestamp()
       });
 
+      // Stop if failed or already processed
       if (status !== "SUCCESS" || payment.ticketCreated) return;
 
       const [eventId, ticketTypeId] = payment.itemId.split("_");
@@ -134,7 +139,7 @@ app.post("/webhook", async (req, res) => {
       tx.update(paymentRef, { ticketCreated: true });
     });
 
-    console.log(`✅ Payment ${reference} processed`);
+    console.log(`✅ Payment ${reference} processed successfully`);
     res.sendStatus(200);
   } catch (err) {
     console.error("[WEBHOOK ERROR]", err);
@@ -143,33 +148,28 @@ app.post("/webhook", async (req, res) => {
 });
 
 /* ---------------------------------------------------
-   CALLBACK (GET) - USER REDIRECT
+   PAYMENT SUCCESS REDIRECT (GET) - USER BROWSER
 --------------------------------------------------- */
-app.get("/webhook", async (req, res) => {
-  const reference = req.query.reference || req.query.tx_ref;
+app.get("/payment-success", (req, res) => {
+  const reference = req.query.reference || req.query.tx_ref || "N/A";
 
-  if (!reference) {
-    return res.status(400).send("Invalid payment reference");
-  }
-
-  try {
-    const snap = await db.collection("payments").doc(reference).get();
-    if (!snap.exists) return res.status(404).send("Payment not found");
-
-    const payment = snap.data();
-
-    if (payment.status === "SUCCESS") {
-      return res.send("Payment successful. You can return to the app.");
-    }
-
-    res.send("Payment pending. Please wait...");
-  } catch (err) {
-    res.status(500).send("Server error");
-  }
+  res.send(`
+    <html>
+      <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      </head>
+      <body style="font-family: Arial; text-align: center; padding: 50px;">
+        <h2 style="color: green;">Payment Successful</h2>
+        <p>Your payment is being verified.</p>
+        <p>Reference: ${reference}</p>
+        <p>You can now return to the app.</p>
+      </body>
+    </html>
+  `);
 });
 
 /* ---------------------------------------------------
-   PAYMENT STATUS CHECK
+   PAYMENT STATUS CHECK (APP POLLING)
 --------------------------------------------------- */
 app.get("/payment-status/:id", async (req, res) => {
   try {
@@ -177,6 +177,7 @@ app.get("/payment-status/:id", async (req, res) => {
     if (!snap.exists) return res.status(404).json({ error: "Not found" });
     res.json(snap.data());
   } catch (err) {
+    console.error("[STATUS ERROR]", err);
     res.status(500).json({ error: err.message });
   }
 });
