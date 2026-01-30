@@ -46,7 +46,7 @@ app.post("/pay", async (req, res) => {
         phone_number: phone,
         network,
         reference: paymentRef,
-        callback_url: "https://paychangu-backend-g9vt.onrender.com/webhook",
+        callback_url: "https://paychangu-backend-g9vt.onrender.com/payment-success",
 
         // ✅ SINGLE SOURCE OF TRUTH
         meta: {
