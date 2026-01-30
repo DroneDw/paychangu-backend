@@ -39,14 +39,14 @@ app.post("/pay", async (req, res) => {
     console.log(`[PAY] Creating payment ${paymentRef}`);
 
     const payResponse = await axios.post(
-      "https://api.paychangu.com/payment  ",
+      "https://api.paychangu.com/payment   ",
       {
         amount,
         currency: "MWK",
         phone_number: phone,
         network,
         reference: paymentRef,
-        callback_url: "https://paychangu-backend-g9vt.onrender.com/payment-success  ",
+        callback_url: "https://paychangu-backend-g9vt.onrender.com/payment-success   ",
 
         // ✅ SINGLE SOURCE OF TRUTH
         meta: {
@@ -237,26 +237,26 @@ app.get("/payment-success", async (req, res) => {
     const payment = snap.data();
 
     if (payment?.status === "SUCCESS" || payment?.ticketCreated) {
-      res.send(`
-        <html>
+      res.send(
+        `<html>
           <body style="font-family:Arial;text-align:center;padding:40px;">
             <h2 style="color:green;">✅ Payment Successful</h2>
             <p>Your ticket has been generated.</p>
             <p>Ref: ${reference}</p>
             <button onclick="window.close()">Close</button>
           </body>
-        </html>
-      `);
+        </html>`
+      );
     } else {
-      res.send(`
-        <html>
+      res.send(
+        `<html>
           <head><meta http-equiv="refresh" content="3"></head>
           <body style="text-align:center;padding:40px;">
             <h2>⏳ Processing...</h2>
             <p>Ref: ${reference}</p>
           </body>
-        </html>
-      `);
+        </html>`
+      );
     }
   } catch {
     res.status(500).send("Server error");
@@ -277,17 +277,17 @@ app.get("/payment-status/:id", async (req, res) => {
 });
 
 /* ---------------------------------------------------
-   TICKET SCANNING (VALIDATION)
+   TICKET SCANNING (VALIDATION) - UPDATED WITH MANAGER CHECK
 --------------------------------------------------- */
 app.post("/scan-ticket", async (req, res) => {
   try {
-    const { qrCode } = req.body;
+    const { qrCode, scannerId } = req.body;
 
     if (!qrCode) {
       return res.status(400).json({ success: false, message: "QR code required" });
     }
 
-    console.log(`[SCAN] Attempting to scan: ${qrCode}`);
+    console.log(`[SCAN] Attempting to scan: ${qrCode} by manager: ${scannerId}`);
 
     await db.runTransaction(async (transaction) => {
       const ticketRef = db.collection("tickets").doc(qrCode);
@@ -300,6 +300,24 @@ app.post("/scan-ticket", async (req, res) => {
       }
 
       const ticket = ticketSnap.data();
+
+      // ✅ MANAGER AUTHORIZATION CHECK
+      // Get the event to verify the manager owns it
+      const eventRef = db.collection("events_balaka").doc(ticket.eventId);
+      const eventSnap = await transaction.get(eventRef);
+
+      if (!eventSnap.exists) {
+        console.log(`[SCAN] ❌ Event not found for ticket: ${qrCode}`);
+        return res.json({ success: false, message: "Event not found for this ticket" });
+      }
+
+      const event = eventSnap.data();
+
+      // Verify that the scanner is the manager of this event
+      if (event.managerId !== scannerId) {
+        console.log(`[SCAN] ❌ Manager ${scannerId} not authorized for event ${ticket.eventId} (owned by ${event.managerId})`);
+        return res.json({ success: false, message: "You cannot scan tickets for this event" });
+      }
 
       // Check if already used
       if (ticket.status === "used") {
@@ -320,7 +338,7 @@ app.post("/scan-ticket", async (req, res) => {
       transaction.update(ticketRef, {
         status: "used",
         scannedAt: admin.firestore.FieldValue.serverTimestamp(),
-        scannedBy: req.body.scannerId || "organizer" // optional: track who scanned
+        scannedBy: scannerId || "organizer" // track who scanned
       });
 
       console.log(`[SCAN] ✅ Valid ticket scanned: ${qrCode} for ${ticket.eventName}`);
