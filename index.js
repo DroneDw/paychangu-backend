@@ -39,14 +39,14 @@ app.post("/pay", async (req, res) => {
     console.log(`[PAY] Creating payment ${paymentRef}`);
 
     const payResponse = await axios.post(
-      "https://api.paychangu.com/payment ",
+      "https://api.paychangu.com/payment  ",
       {
         amount,
         currency: "MWK",
         phone_number: phone,
         network,
         reference: paymentRef,
-        callback_url: "https://paychangu-backend-g9vt.onrender.com/payment-success ",
+        callback_url: "https://paychangu-backend-g9vt.onrender.com/payment-success  ",
 
         // ✅ SINGLE SOURCE OF TRUTH
         meta: {
@@ -148,21 +148,40 @@ app.post("/webhook", async (req, res) => {
         let eventName = "Event";
         let ticketTypeName = "Ticket";
 
-        try {
-          const eventSnap = await db.collection("events_balaka").doc(eventId).get();
-          if (eventSnap.exists) {
-            const eventData = eventSnap.data();
-            eventName = eventData?.title || eventData?.name || "Event";
+        const eventRef = db.collection("events_balaka").doc(eventId);
+        const eventSnap = await transaction.get(eventRef);
 
-            // Find ticket type name from the array
-            const ticketTypes = eventData?.ticketTypes || [];
-            const foundType = ticketTypes.find(t => t.id === ticketTypeId);
-            if (foundType) {
-              ticketTypeName = foundType.name || "Ticket";
-            }
+        if (eventSnap.exists) {
+          const eventData = eventSnap.data();
+          eventName = eventData?.title || eventData?.name || "Event";
+
+          // Find ticket type name from the array and update counts
+          const ticketTypes = eventData?.ticketTypes || [];
+          const ticketTypeIndex = ticketTypes.findIndex(t => t.id === ticketTypeId);
+
+          if (ticketTypeIndex !== -1) {
+            const ticketType = ticketTypes[ticketTypeIndex];
+            ticketTypeName = ticketType.name || "Ticket";
+
+            // ✅ UPDATE AVAILABLE COUNT (FIXED)
+            const currentSold = ticketType.sold || 0;
+            const currentQty = ticketType.quantity || 0;
+            const newSold = currentSold + 1;
+            const newAvailable = Math.max(0, currentQty - newSold);
+
+            const updatedTicketTypes = [...ticketTypes];
+            updatedTicketTypes[ticketTypeIndex] = {
+              ...ticketType,
+              sold: newSold,
+              available: newAvailable
+            };
+
+            transaction.update(eventRef, {
+              ticketTypes: updatedTicketTypes
+            });
+
+            console.log(`[WEBHOOK] Updated ${ticketTypeName}: sold=${newSold}, available=${newAvailable}`);
           }
-        } catch (e) {
-          console.log("[WEBHOOK] Could not fetch event details, using defaults");
         }
 
         const ticketId = `TICKET_${paymentRef}`;
