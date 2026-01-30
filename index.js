@@ -277,6 +277,66 @@ app.get("/payment-status/:id", async (req, res) => {
 });
 
 /* ---------------------------------------------------
+   TICKET SCANNING (VALIDATION)
+--------------------------------------------------- */
+app.post("/scan-ticket", async (req, res) => {
+  try {
+    const { qrCode } = req.body;
+
+    if (!qrCode) {
+      return res.status(400).json({ success: false, message: "QR code required" });
+    }
+
+    console.log(`[SCAN] Attempting to scan: ${qrCode}`);
+
+    await db.runTransaction(async (transaction) => {
+      const ticketRef = db.collection("tickets").doc(qrCode);
+      const ticketSnap = await transaction.get(ticketRef);
+
+      // Check if ticket exists
+      if (!ticketSnap.exists) {
+        console.log(`[SCAN] ❌ Ticket not found: ${qrCode}`);
+        return res.json({ success: false, message: "Invalid ticket - not found" });
+      }
+
+      const ticket = ticketSnap.data();
+
+      // Check if already used
+      if (ticket.status === "used") {
+        console.log(`[SCAN] ⚠️ Already used: ${qrCode}`);
+        return res.json({
+          success: false,
+          message: `Ticket already used on ${ticket.usedAt?.toDate() || "unknown date"}`
+        });
+      }
+
+      // Check if ticket is active
+      if (ticket.status !== "active") {
+        console.log(`[SCAN] ❌ Ticket not active: ${qrCode}, status: ${ticket.status}`);
+        return res.json({ success: false, message: `Ticket status: ${ticket.status}` });
+      }
+
+      // ✅ VALID - Mark as used
+      transaction.update(ticketRef, {
+        status: "used",
+        scannedAt: admin.firestore.FieldValue.serverTimestamp(),
+        scannedBy: req.body.scannerId || "organizer" // optional: track who scanned
+      });
+
+      console.log(`[SCAN] ✅ Valid ticket scanned: ${qrCode} for ${ticket.eventName}`);
+      return res.json({
+        success: true,
+        message: `Valid: ${ticket.ticketTypeName} - ${ticket.eventName}`
+      });
+    });
+
+  } catch (err) {
+    console.error("[SCAN ERROR]", err);
+    res.status(500).json({ success: false, message: "Server error during scan" });
+  }
+});
+
+/* ---------------------------------------------------
    SERVER
 --------------------------------------------------- */
 const PORT = process.env.PORT || 8080;
