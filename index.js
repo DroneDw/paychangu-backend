@@ -39,14 +39,14 @@ app.post("/pay", async (req, res) => {
     console.log(`[PAY] Creating payment ${paymentRef}`);
 
     const payResponse = await axios.post(
-      "https://api.paychangu.com/payment",
+      "https://api.paychangu.com/payment ",
       {
         amount,
         currency: "MWK",
         phone_number: phone,
         network,
         reference: paymentRef,
-        callback_url: "https://paychangu-backend-g9vt.onrender.com/payment-success",
+        callback_url: "https://paychangu-backend-g9vt.onrender.com/payment-success ",
 
         // ✅ SINGLE SOURCE OF TRUTH
         meta: {
@@ -143,13 +143,37 @@ app.post("/webhook", async (req, res) => {
 
       if (status === "SUCCESS") {
         const [eventId, ticketTypeId] = payment.itemId.split("_");
+
+        // ✅ FETCH EVENT DETAILS FOR BEAUTIFUL TICKET DISPLAY
+        let eventName = "Event";
+        let ticketTypeName = "Ticket";
+
+        try {
+          const eventSnap = await db.collection("events_balaka").doc(eventId).get();
+          if (eventSnap.exists) {
+            const eventData = eventSnap.data();
+            eventName = eventData?.title || eventData?.name || "Event";
+
+            // Find ticket type name from the array
+            const ticketTypes = eventData?.ticketTypes || [];
+            const foundType = ticketTypes.find(t => t.id === ticketTypeId);
+            if (foundType) {
+              ticketTypeName = foundType.name || "Ticket";
+            }
+          }
+        } catch (e) {
+          console.log("[WEBHOOK] Could not fetch event details, using defaults");
+        }
+
         const ticketId = `TICKET_${paymentRef}`;
 
         transaction.set(db.collection("tickets").doc(ticketId), {
           id: ticketId,
           userId: payment.userId,
           eventId,
+          eventName,        // ✅ Human-readable event name
           ticketTypeId,
+          ticketTypeName,   // ✅ Human-readable ticket type name
           paymentId: paymentRef,
           status: "active",
           qrCode: ticketId,
@@ -157,7 +181,7 @@ app.post("/webhook", async (req, res) => {
         });
 
         transaction.update(paymentDoc, { ticketCreated: true });
-        console.log(`[WEBHOOK] ✅ Ticket created: ${ticketId}`);
+        console.log(`[WEBHOOK] ✅ Ticket created: ${ticketId} for ${eventName}`);
       }
     });
 
