@@ -37,6 +37,10 @@ app.post("/pay", async (req, res) => {
     const paymentRef = crypto.randomUUID();
     console.log(`[PAY] Creating payment ${paymentRef}`);
 
+    // Ensure BACKEND_URL is set in env
+    const callbackUrl =
+      process.env.BACKEND_URL || "https://paychangu-backend-g9vt.onrender.com";
+
     const payResponse = await axios.post(
       "https://api.paychangu.com/payment",
       {
@@ -45,8 +49,8 @@ app.post("/pay", async (req, res) => {
         phone_number: phone,
         network,
         reference: paymentRef,
-        callback_url: `${process.env.BACKEND_URL}/webhook`,
-        meta: { userId, itemId } // ✅ include metadata
+        callback_url: `${callbackUrl}/webhook`,
+        meta: { userId, itemId } // include metadata
       },
       {
         headers: {
@@ -75,8 +79,8 @@ app.post("/pay", async (req, res) => {
 
     res.json({ paymentId: paymentRef, checkoutUrl });
   } catch (err) {
-    console.error("[PAY ERROR]", err.message);
-    res.status(500).json({ error: err.message });
+    console.error("[PAY ERROR]", err.response?.data || err.message);
+    res.status(500).json({ error: err.response?.data || err.message });
   }
 });
 
@@ -90,6 +94,7 @@ app.post("/webhook", async (req, res) => {
     const signature = req.headers["x-paychangu-signature"];
     const webhookSecret = process.env.PAYCHANGU_WEBHOOK_SECRET;
 
+    // Verify signature if provided
     if (webhookSecret && signature) {
       const expectedSignature = crypto
         .createHmac("sha256", webhookSecret)
@@ -122,29 +127,24 @@ app.post("/webhook", async (req, res) => {
 
       let payment;
 
-      // ✅ Create payment if missing
+      // Create payment if missing (from webhook)
       if (!snap.exists) {
         console.log(`[WEBHOOK] ℹ️ Creating missing payment ${reference}`);
         payment = {
-          userId: payload.meta?.userId,
-          itemId: payload.meta?.itemId,
+          userId: payload.meta?.userId || "UNKNOWN_USER",
+          itemId: payload.meta?.itemId || "UNKNOWN_ITEM",
           amount: payload.amount || 0,
           status,
           ticketCreated: false,
           createdAt: admin.firestore.FieldValue.serverTimestamp()
         };
 
-        if (!payment.userId || !payment.itemId) {
-          console.error("[WEBHOOK] ❌ Missing userId or itemId in metadata");
-          return;
-        }
-
         transaction.set(paymentDoc, payment);
       } else {
         payment = snap.data();
       }
 
-      // ✅ Idempotency: stop if ticket already created
+      // Stop if ticket already created
       if (payment.ticketCreated) {
         console.log(`[WEBHOOK] ℹ️ Already processed: ${reference}`);
         return;
@@ -156,8 +156,8 @@ app.post("/webhook", async (req, res) => {
         updatedAt: admin.firestore.FieldValue.serverTimestamp()
       });
 
-      // ✅ Create ticket if payment successful
-      if (status === "SUCCESS") {
+      // Create ticket if payment successful and itemId exists
+      if (status === "SUCCESS" && payment.itemId.includes("_")) {
         const [eventId, ticketTypeId] = payment.itemId.split("_");
         const ticketId = `TICKET_${reference}`;
 
@@ -174,6 +174,10 @@ app.post("/webhook", async (req, res) => {
 
         transaction.update(paymentDoc, { ticketCreated: true });
         console.log(`[WEBHOOK] ✅ Ticket created: ${ticketId}`);
+      } else if (status === "SUCCESS") {
+        console.log(
+          `[WEBHOOK] ⚠️ Payment successful but invalid itemId: ${payment.itemId}`
+        );
       } else {
         console.log(`[WEBHOOK] ❌ Payment failed: ${reference}`);
       }
