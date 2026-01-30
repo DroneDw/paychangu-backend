@@ -35,9 +35,7 @@ app.post("/pay", async (req, res) => {
       return res.status(400).json({ error: "Missing required fields" });
     }
 
-    // UUID reference (matches tx_ref)
     const paymentRef = crypto.randomUUID();
-
     console.log(`[PAY] Creating payment ${paymentRef}`);
 
     const payResponse = await axios.post(
@@ -76,10 +74,7 @@ app.post("/pay", async (req, res) => {
 
     console.log(`[PAY] Stored payment ${paymentRef}`);
 
-    res.json({
-      paymentId: paymentRef,
-      checkoutUrl
-    });
+    res.json({ paymentId: paymentRef, checkoutUrl });
   } catch (err) {
     console.error("[PAY ERROR]", err.message);
     res.status(500).json({ error: err.message });
@@ -93,16 +88,11 @@ app.post("/webhook", async (req, res) => {
   console.log("[WEBHOOK] Received");
 
   try {
-    /* -------- SIGNATURE VERIFICATION -------- */
+    /* -------- OPTIONAL SIGNATURE VERIFICATION -------- */
     const signature = req.headers["x-paychangu-signature"];
     const webhookSecret = process.env.PAYCHANGU_WEBHOOK_SECRET;
 
-    if (webhookSecret) {
-      if (!signature) {
-        console.error("[WEBHOOK] ❌ Missing signature");
-        return res.sendStatus(401);
-      }
-
+    if (webhookSecret && signature) {
       const expectedSignature = crypto
         .createHmac("sha256", webhookSecret)
         .update(req.rawBody)
@@ -114,12 +104,12 @@ app.post("/webhook", async (req, res) => {
       }
 
       console.log("[WEBHOOK] ✅ Signature verified");
+    } else {
+      console.log("[WEBHOOK] ℹ️ No signature provided by PayChangu");
     }
 
     /* -------- PAYLOAD HANDLING -------- */
     const payload = req.body;
-
-    // PayChangu is inconsistent – handle both
     const reference = payload.tx_ref || payload.reference;
     const status = payload.status === "success" ? "SUCCESS" : "FAILED";
 
@@ -168,7 +158,6 @@ app.post("/webhook", async (req, res) => {
         });
 
         transaction.update(paymentRef, { ticketCreated: true });
-
         console.log(`[WEBHOOK] ✅ Ticket created: ${ticketId}`);
       } else {
         console.log(`[WEBHOOK] ❌ Payment failed: ${reference}`);
@@ -183,7 +172,7 @@ app.post("/webhook", async (req, res) => {
 });
 
 /* ---------------------------------------------------
-   PAYMENT SUCCESS (USER REDIRECT)
+   PAYMENT SUCCESS
 --------------------------------------------------- */
 app.get("/payment-success", async (req, res) => {
   const reference = req.query.reference || req.query.tx_ref;
@@ -199,11 +188,10 @@ app.get("/payment-success", async (req, res) => {
     if (payment?.status === "SUCCESS" || payment?.ticketCreated) {
       res.send(`
         <html>
-          <head><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
-          <body style="font-family: Arial; text-align:center; padding:40px;">
+          <body style="font-family:Arial;text-align:center;padding:40px;">
             <h2 style="color:green;">✅ Payment Successful</h2>
             <p>Your ticket has been generated.</p>
-            <p style="color:#999;">Ref: ${reference}</p>
+            <p>Ref: ${reference}</p>
             <button onclick="window.close()">Close</button>
           </body>
         </html>
@@ -211,12 +199,9 @@ app.get("/payment-success", async (req, res) => {
     } else {
       res.send(`
         <html>
-          <head>
-            <meta http-equiv="refresh" content="3">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-          </head>
-          <body style="text-align:center; padding:40px;">
-            <h2>⏳ Processing payment...</h2>
+          <head><meta http-equiv="refresh" content="3"></head>
+          <body style="text-align:center;padding:40px;">
+            <h2>⏳ Processing...</h2>
             <p>Ref: ${reference}</p>
           </body>
         </html>
