@@ -48,7 +48,7 @@ app.post("/pay", async (req, res) => {
         reference: paymentRef,
         callback_url: "https://paychangu-backend-g9vt.onrender.com/webhook",
 
-        // ✅ FIX: ALWAYS SEND YOUR PAYMENT REF
+        // ✅ SINGLE SOURCE OF TRUTH
         meta: {
           paymentRef,
           userId,
@@ -69,6 +69,7 @@ app.post("/pay", async (req, res) => {
     }
 
     await db.collection("payments").doc(paymentRef).set({
+      id: paymentRef,
       userId,
       itemId,
       amount,
@@ -80,11 +81,10 @@ app.post("/pay", async (req, res) => {
     });
 
     console.log(`[PAY] Stored payment ${paymentRef}`);
-
     res.json({ paymentId: paymentRef, checkoutUrl });
   } catch (err) {
-    console.error("[PAY ERROR]", err.message);
-    res.status(500).json({ error: err.message });
+    console.error("[PAY ERROR]", err.response?.data || err.message);
+    res.status(500).json({ error: "Payment initialization failed" });
   }
 });
 
@@ -110,43 +110,43 @@ app.post("/webhook", async (req, res) => {
       }
 
       console.log("[WEBHOOK] ✅ Signature verified");
-    } else {
-      console.log("[WEBHOOK] ℹ️ No signature provided by PayChangu");
     }
 
     const payload = req.body;
+    console.log("[WEBHOOK] Payload:", JSON.stringify(payload, null, 2));
 
-    // ✅ FIX: ALWAYS USE YOUR PAYMENT REF FIRST
-    const reference =
+    // ✅ ALWAYS USE YOUR OWN PAYMENT REF
+    const paymentRef =
       payload?.meta?.paymentRef ||
-      payload?.reference ||
-      payload?.tx_ref;
+      payload?.data?.meta?.paymentRef;
 
-    const status = payload.status === "success" ? "SUCCESS" : "FAILED";
-
-    if (!reference) {
-      console.error("[WEBHOOK] ❌ Missing reference");
+    if (!paymentRef) {
+      console.error("[WEBHOOK] ❌ paymentRef missing in metadata");
       return res.sendStatus(400);
     }
 
-    console.log(`[WEBHOOK] Ref=${reference} Status=${status}`);
-    console.log("[WEBHOOK] Meta:", payload.meta);
+    const status =
+      payload.status === "success" ||
+      payload?.data?.status === "success"
+        ? "SUCCESS"
+        : "FAILED";
+
+    console.log(`[WEBHOOK] paymentRef=${paymentRef} status=${status}`);
 
     await db.runTransaction(async (transaction) => {
-      const paymentDoc = db.collection("payments").doc(reference);
+      const paymentDoc = db.collection("payments").doc(paymentRef);
       const snap = await transaction.get(paymentDoc);
 
-      // ❌ DO NOT CREATE MISSING PAYMENTS
       if (!snap.exists) {
-        console.error(`[WEBHOOK] ❌ Payment not found: ${reference}`);
+        console.error(`[WEBHOOK] ❌ Payment not found: ${paymentRef}`);
         return;
       }
 
       const payment = snap.data();
 
-      // ✅ IDEMPOTENCY CHECK
+      // ✅ IDEMPOTENCY
       if (payment.ticketCreated) {
-        console.log(`[WEBHOOK] ℹ️ Already processed: ${reference}`);
+        console.log(`[WEBHOOK] ℹ️ Already processed: ${paymentRef}`);
         return;
       }
 
@@ -157,14 +157,14 @@ app.post("/webhook", async (req, res) => {
 
       if (status === "SUCCESS") {
         const [eventId, ticketTypeId] = payment.itemId.split("_");
-        const ticketId = `TICKET_${reference}`;
+        const ticketId = `TICKET_${paymentRef}`;
 
         transaction.set(db.collection("tickets").doc(ticketId), {
           id: ticketId,
           userId: payment.userId,
           eventId,
           ticketTypeId,
-          paymentId: reference,
+          paymentId: paymentRef,
           status: "active",
           qrCode: ticketId,
           createdAt: admin.firestore.FieldValue.serverTimestamp()
@@ -172,8 +172,6 @@ app.post("/webhook", async (req, res) => {
 
         transaction.update(paymentDoc, { ticketCreated: true });
         console.log(`[WEBHOOK] ✅ Ticket created: ${ticketId}`);
-      } else {
-        console.log(`[WEBHOOK] ❌ Payment failed: ${reference}`);
       }
     });
 
