@@ -8,16 +8,24 @@ import { db, admin } from "./firebaseAdmin.js";
 dotenv.config();
 
 const app = express();
-app.use(cors());
-app.use(express.json());
-
-// Generate UUID helper
-function generateUUID() {
-  return crypto.randomUUID();
-}
 
 /* ---------------------------------------------------
-   PAY INIT - Creates payment with metadata for webhook
+   MIDDLEWARE
+--------------------------------------------------- */
+
+// Capture RAW body for webhook signature verification
+app.use(
+  express.json({
+    verify: (req, res, buf) => {
+      req.rawBody = buf.toString();
+    }
+  })
+);
+
+app.use(cors());
+
+/* ---------------------------------------------------
+   PAY INIT
 --------------------------------------------------- */
 app.post("/pay", async (req, res) => {
   try {
@@ -27,9 +35,8 @@ app.post("/pay", async (req, res) => {
       return res.status(400).json({ error: "Missing required fields" });
     }
 
-    const paymentRef = generateUUID();
-
-    console.log(`[PAY] Creating payment ${paymentRef} for user ${userId}, item ${itemId}`);
+    const paymentRef = crypto.randomUUID();
+    console.log(`[PAY] Creating payment ${paymentRef}`);
 
     const payResponse = await axios.post(
       "https://api.paychangu.com/payment",
@@ -39,12 +46,12 @@ app.post("/pay", async (req, res) => {
         phone_number: phone,
         network,
         reference: paymentRef,
-        callback_url: "https://paychangu-backend-g9vt.onrender.com/payment-success",
+        callback_url: "https://paychangu-backend-g9vt.onrender.com/webhook",
 
-        // ✅ CRITICAL FIX: Send user data as metadata so it comes back in webhook
+        // ✅ FIX: send userId and itemId in metadata
         meta: {
-          userId: userId,
-          itemId: itemId
+          userId,
+          itemId
         }
       },
       {
@@ -60,7 +67,6 @@ app.post("/pay", async (req, res) => {
       throw new Error("Checkout URL missing from PayChangu");
     }
 
-    // Store payment with correct user info
     await db.collection("payments").doc(paymentRef).set({
       userId,
       itemId,
@@ -73,6 +79,7 @@ app.post("/pay", async (req, res) => {
     });
 
     console.log(`[PAY] Stored payment ${paymentRef}`);
+
     res.json({ paymentId: paymentRef, checkoutUrl });
   } catch (err) {
     console.error("[PAY ERROR]", err.message);
@@ -81,115 +88,101 @@ app.post("/pay", async (req, res) => {
 });
 
 /* ---------------------------------------------------
-   WEBHOOK (POST) - Reads metadata to create ticket with correct owner
+   WEBHOOK
 --------------------------------------------------- */
 app.post("/webhook", async (req, res) => {
   console.log("[WEBHOOK] Received");
 
   try {
-    // Optional: Verify signature
     const signature = req.headers["x-paychangu-signature"];
     const webhookSecret = process.env.PAYCHANGU_WEBHOOK_SECRET;
 
     if (webhookSecret && signature) {
       const expectedSignature = crypto
         .createHmac("sha256", webhookSecret)
-        .update(JSON.stringify(req.body))
+        .update(req.rawBody)
         .digest("hex");
 
       if (signature !== expectedSignature) {
         console.error("[WEBHOOK] ❌ Invalid signature");
         return res.sendStatus(401);
       }
-    } else if (!signature && webhookSecret) {
-      console.warn("[WEBHOOK] ⚠️ No signature provided");
+
+      console.log("[WEBHOOK] ✅ Signature verified");
+    } else {
+      console.log("[WEBHOOK] ℹ️ No signature provided by PayChangu");
     }
 
     const payload = req.body;
     const reference = payload.tx_ref || payload.reference;
     const status = payload.status === "success" ? "SUCCESS" : "FAILED";
 
-    console.log(`[WEBHOOK] Ref: ${reference}, Status: ${status}`);
-
     if (!reference) {
       console.error("[WEBHOOK] ❌ Missing reference");
       return res.sendStatus(400);
     }
 
-    // ✅ CRITICAL FIX: Get userId and itemId from metadata (payload.meta)
-    // PayChangu sends back the meta object we sent in /pay
-    const userId = payload.meta?.userId;
-    const itemId = payload.meta?.itemId;
+    console.log(`[WEBHOOK] Ref=${reference} Status=${status}`);
 
-    if (!userId || !itemId) {
-      console.error("[WEBHOOK] ❌ Missing userId or itemId in metadata:", payload.meta);
-      return res.sendStatus(400); // Reject if we can't identify the user
-    }
-
-    // Check if payment document exists (it should, created by /pay)
-    const paymentDocRef = db.collection("payments").doc(reference);
-    const paymentSnap = await paymentDocRef.get();
-
-    if (!paymentSnap.exists) {
-      console.error(`[WEBHOOK] ❌ Payment ${reference} not found in DB`);
-      // Still create it if webhook arrives before DB write completes
-      await paymentDocRef.set({
-        userId,
-        itemId,
-        amount: payload.amount || 0,
-        status: "PENDING",
-        ticketCreated: false,
-        createdAt: admin.firestore.FieldValue.serverTimestamp()
-      });
-    }
-
-    // Use transaction to prevent duplicates
     await db.runTransaction(async (transaction) => {
-      const snap = await transaction.get(paymentDocRef);
-      const payment = snap.data();
+      const paymentDoc = db.collection("payments").doc(reference);
+      const snap = await transaction.get(paymentDoc);
 
-      if (!payment) {
-        console.error("[WEBHOOK] Payment data missing");
-        return;
+      let payment;
+
+      // ✅ CREATE PAYMENT IF MISSING
+      if (!snap.exists) {
+        console.log(`[WEBHOOK] ℹ️ Creating missing payment ${reference}`);
+
+        payment = {
+          userId: payload.meta?.userId,
+          itemId: payload.meta?.itemId,
+          amount: payload.amount || 0,
+          status,
+          ticketCreated: false,
+          createdAt: admin.firestore.FieldValue.serverTimestamp()
+        };
+
+        if (!payment.userId || !payment.itemId) {
+          console.error("[WEBHOOK] ❌ Missing userId or itemId in metadata");
+          return;
+        }
+
+        transaction.set(paymentDoc, payment);
+      } else {
+        payment = snap.data();
       }
 
-      // Prevent double processing
+      // ✅ IDEMPOTENCY CHECK
       if (payment.ticketCreated) {
         console.log(`[WEBHOOK] ℹ️ Already processed: ${reference}`);
         return;
       }
 
-      // Update payment status
-      transaction.update(paymentDocRef, {
+      transaction.update(paymentDoc, {
         status,
         updatedAt: admin.firestore.FieldValue.serverTimestamp()
       });
 
       if (status === "SUCCESS") {
-        // Parse itemId (format: "eventId_ticketTypeId")
-        const [eventId, ticketTypeId] = itemId.split("_");
-
-        if (!eventId || !ticketTypeId) {
-          console.error("[WEBHOOK] ❌ Invalid itemId format:", itemId);
-          return;
-        }
-
+        const [eventId, ticketTypeId] = payment.itemId.split("_");
         const ticketId = `TICKET_${reference}`;
 
-        // Create ticket with CORRECT userId from metadata
         transaction.set(db.collection("tickets").doc(ticketId), {
           id: ticketId,
-          userId: userId,  // ✅ This will now be the real Firebase UID
-          eventId: eventId,
-          ticketTypeId: ticketTypeId,
+          userId: payment.userId,
+          eventId,
+          ticketTypeId,
           paymentId: reference,
           status: "active",
           qrCode: ticketId,
           createdAt: admin.firestore.FieldValue.serverTimestamp()
         });
 
-        transaction.update(paymentDocRef, { ticketCreated: true });
-        console.log(`[WEBHOOK] ✅ Ticket created: ${ticketId} for user ${userId}`);
+        transaction.update(paymentDoc, { ticketCreated: true });
+        console.log(`[WEBHOOK] ✅ Ticket created: ${ticketId}`);
+      } else {
+        console.log(`[WEBHOOK] ❌ Payment failed: ${reference}`);
       }
     });
 
@@ -201,13 +194,13 @@ app.post("/webhook", async (req, res) => {
 });
 
 /* ---------------------------------------------------
-   PAYMENT SUCCESS (GET) - User redirect page
+   PAYMENT SUCCESS PAGE
 --------------------------------------------------- */
 app.get("/payment-success", async (req, res) => {
   const reference = req.query.reference || req.query.tx_ref;
 
   if (!reference) {
-    return res.status(400).send("<h2>❌ Invalid reference</h2>");
+    return res.send("<h2>❌ Invalid reference</h2>");
   }
 
   try {
@@ -217,42 +210,32 @@ app.get("/payment-success", async (req, res) => {
     if (payment?.status === "SUCCESS" || payment?.ticketCreated) {
       res.send(`
         <html>
-          <head>
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <meta http-equiv="refresh" content="3;url=https://paychangu-backend-g9vt.onrender.com/payment-status/${reference}">
-          </head>
-          <body style="font-family: Arial; text-align: center; padding: 50px; background: #f5f5f5;">
-            <div style="max-width: 400px; margin: 0 auto; background: white; padding: 40px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
-              <div style="font-size: 60px; color: #4caf50; margin-bottom: 20px;">✓</div>
-              <h2 style="color: #4caf50; margin-top: 0;">Payment Successful!</h2>
-              <p style="color: #666;">Your ticket has been generated.</p>
-              <p style="color: #999; font-size: 14px;">Ref: ${reference}</p>
-            </div>
+          <body style="font-family:Arial;text-align:center;padding:40px;">
+            <h2 style="color:green;">✅ Payment Successful</h2>
+            <p>Your ticket has been generated.</p>
+            <p>Ref: ${reference}</p>
+            <button onclick="window.close()">Close</button>
           </body>
         </html>
       `);
     } else {
       res.send(`
         <html>
-          <head>
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <meta http-equiv="refresh" content="3">
-          </head>
-          <body style="text-align: center; padding: 50px;">
+          <head><meta http-equiv="refresh" content="3"></head>
+          <body style="text-align:center;padding:40px;">
             <h2>⏳ Processing...</h2>
-            <p>Checking payment status...</p>
-            <p style="color: #999;">Ref: ${reference}</p>
+            <p>Ref: ${reference}</p>
           </body>
         </html>
       `);
     }
-  } catch (err) {
-    res.status(500).send("Server Error");
+  } catch {
+    res.status(500).send("Server error");
   }
 });
 
 /* ---------------------------------------------------
-   STATUS CHECK (for app polling)
+   PAYMENT STATUS CHECK
 --------------------------------------------------- */
 app.get("/payment-status/:id", async (req, res) => {
   try {
@@ -264,6 +247,9 @@ app.get("/payment-status/:id", async (req, res) => {
   }
 });
 
+/* ---------------------------------------------------
+   SERVER
+--------------------------------------------------- */
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log("🚀 Server running on port", PORT);
