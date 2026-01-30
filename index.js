@@ -88,48 +88,35 @@ app.post("/pay", async (req, res) => {
   }
 });
 
-/* ---------------------------------------------------
-   WEBHOOK
---------------------------------------------------- */
 app.post("/webhook", async (req, res) => {
   console.log("[WEBHOOK] Received");
 
   try {
-    const signature = req.headers["x-paychangu-signature"];
-    const webhookSecret = process.env.PAYCHANGU_WEBHOOK_SECRET;
-
-    if (webhookSecret && signature) {
-      const expectedSignature = crypto
-        .createHmac("sha256", webhookSecret)
-        .update(req.rawBody)
-        .digest("hex");
-
-      if (signature !== expectedSignature) {
-        console.error("[WEBHOOK] ❌ Invalid signature");
-        return res.sendStatus(401);
-      }
-
-      console.log("[WEBHOOK] ✅ Signature verified");
-    }
-
     const payload = req.body;
     console.log("[WEBHOOK] Payload:", JSON.stringify(payload, null, 2));
 
-    // ✅ ALWAYS USE YOUR OWN PAYMENT REF
-    const paymentRef =
-      payload?.meta?.paymentRef ||
-      payload?.data?.meta?.paymentRef;
+    // ✅ SAFELY PARSE META
+    let meta = payload.meta;
+
+    if (typeof meta === "string") {
+      try {
+        meta = JSON.parse(meta);
+        console.log("[WEBHOOK] Parsed meta:", meta);
+      } catch (e) {
+        console.error("[WEBHOOK] ❌ Failed to parse meta string");
+        return res.sendStatus(400);
+      }
+    }
+
+    const paymentRef = meta?.paymentRef;
 
     if (!paymentRef) {
-      console.error("[WEBHOOK] ❌ paymentRef missing in metadata");
+      console.error("[WEBHOOK] ❌ paymentRef missing after parsing meta");
       return res.sendStatus(400);
     }
 
     const status =
-      payload.status === "success" ||
-      payload?.data?.status === "success"
-        ? "SUCCESS"
-        : "FAILED";
+      payload.status === "success" ? "SUCCESS" : "FAILED";
 
     console.log(`[WEBHOOK] paymentRef=${paymentRef} status=${status}`);
 
@@ -144,7 +131,6 @@ app.post("/webhook", async (req, res) => {
 
       const payment = snap.data();
 
-      // ✅ IDEMPOTENCY
       if (payment.ticketCreated) {
         console.log(`[WEBHOOK] ℹ️ Already processed: ${paymentRef}`);
         return;
