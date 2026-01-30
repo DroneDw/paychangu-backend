@@ -2,13 +2,27 @@ import express from "express";
 import axios from "axios";
 import cors from "cors";
 import dotenv from "dotenv";
+import crypto from "crypto";
 import { db, admin } from "./firebaseAdmin.js";
 
 dotenv.config();
 
 const app = express();
+
+/* ---------------------------------------------------
+   MIDDLEWARE
+--------------------------------------------------- */
+
+// Capture RAW body for webhook signature verification
+app.use(
+  express.json({
+    verify: (req, res, buf) => {
+      req.rawBody = buf.toString();
+    }
+  })
+);
+
 app.use(cors());
-app.use(express.json());
 
 /* ---------------------------------------------------
    PAY INIT
@@ -21,7 +35,10 @@ app.post("/pay", async (req, res) => {
       return res.status(400).json({ error: "Missing required fields" });
     }
 
-    const paymentRef = `PAY_${Date.now()}`;
+    // UUID reference (matches tx_ref)
+    const paymentRef = crypto.randomUUID();
+
+    console.log(`[PAY] Creating payment ${paymentRef}`);
 
     const payResponse = await axios.post(
       "https://api.paychangu.com/payment",
@@ -57,7 +74,12 @@ app.post("/pay", async (req, res) => {
       createdAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
-    res.json({ paymentId: paymentRef, checkoutUrl });
+    console.log(`[PAY] Stored payment ${paymentRef}`);
+
+    res.json({
+      paymentId: paymentRef,
+      checkoutUrl
+    });
   } catch (err) {
     console.error("[PAY ERROR]", err.message);
     res.status(500).json({ error: err.message });
@@ -65,61 +87,93 @@ app.post("/pay", async (req, res) => {
 });
 
 /* ---------------------------------------------------
-   WEBHOOK (POST) - No signature check for now
+   WEBHOOK
 --------------------------------------------------- */
 app.post("/webhook", async (req, res) => {
-  console.log("🔥 WEBHOOK RECEIVED");
+  console.log("[WEBHOOK] Received");
 
   try {
-    // Extract data from PayChangu payload (root level)
+    /* -------- SIGNATURE VERIFICATION -------- */
+    const signature = req.headers["x-paychangu-signature"];
+    const webhookSecret = process.env.PAYCHANGU_WEBHOOK_SECRET;
+
+    if (webhookSecret) {
+      if (!signature) {
+        console.error("[WEBHOOK] ❌ Missing signature");
+        return res.sendStatus(401);
+      }
+
+      const expectedSignature = crypto
+        .createHmac("sha256", webhookSecret)
+        .update(req.rawBody)
+        .digest("hex");
+
+      if (signature !== expectedSignature) {
+        console.error("[WEBHOOK] ❌ Invalid signature");
+        return res.sendStatus(401);
+      }
+
+      console.log("[WEBHOOK] ✅ Signature verified");
+    }
+
+    /* -------- PAYLOAD HANDLING -------- */
     const payload = req.body;
+
+    // PayChangu is inconsistent – handle both
     const reference = payload.tx_ref || payload.reference;
     const status = payload.status === "success" ? "SUCCESS" : "FAILED";
 
-    console.log(`Reference: ${reference}, Status: ${status}`);
-
     if (!reference) {
-      console.error("❌ Missing reference. Payload:", JSON.stringify(payload));
+      console.error("[WEBHOOK] ❌ Missing reference");
       return res.sendStatus(400);
     }
 
-    const paymentRef = db.collection("payments").doc(reference);
-    const snap = await paymentRef.get();
+    console.log(`[WEBHOOK] Ref=${reference} Status=${status}`);
 
-    if (!snap.exists) {
-      console.log("⚠️ Payment not found in DB:", reference);
-      return res.sendStatus(200); // Acknowledge to stop retries
-    }
+    /* -------- ATOMIC TRANSACTION -------- */
+    await db.runTransaction(async (transaction) => {
+      const paymentRef = db.collection("payments").doc(reference);
+      const snap = await transaction.get(paymentRef);
 
-    const payment = snap.data();
+      if (!snap.exists) {
+        console.error(`[WEBHOOK] ❌ Payment not found: ${reference}`);
+        return;
+      }
 
-    // Update status
-    await paymentRef.update({
-      status,
-      updatedAt: admin.firestore.FieldValue.serverTimestamp()
-    });
+      const payment = snap.data();
 
-    // Create ticket only if success and not already created
-    if (status === "SUCCESS" && !payment.ticketCreated) {
-      const [eventId, ticketTypeId] = payment.itemId.split("_");
-      const ticketId = `TICKET_${reference}`;
+      if (payment.ticketCreated) {
+        console.log(`[WEBHOOK] ℹ️ Already processed: ${reference}`);
+        return;
+      }
 
-      await db.collection("tickets").doc(ticketId).set({
-        id: ticketId,
-        userId: payment.userId,
-        eventId,
-        ticketTypeId,
-        paymentId: reference,
-        status: "active",
-        qrCode: ticketId,
-        createdAt: admin.firestore.FieldValue.serverTimestamp()
+      transaction.update(paymentRef, {
+        status,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
       });
 
-      await paymentRef.update({ ticketCreated: true });
-      console.log(`✅ Ticket created: ${ticketId}`);
-    } else {
-      console.log(`ℹ️ Skipped: status=${status}, alreadyCreated=${payment.ticketCreated}`);
-    }
+      if (status === "SUCCESS") {
+        const [eventId, ticketTypeId] = payment.itemId.split("_");
+        const ticketId = `TICKET_${reference}`;
+
+        transaction.set(db.collection("tickets").doc(ticketId), {
+          id: ticketId,
+          userId: payment.userId,
+          eventId,
+          ticketTypeId,
+          paymentId: reference,
+          status: "active",
+          qrCode: ticketId,
+          createdAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+
+        transaction.update(paymentRef, { ticketCreated: true });
+
+        console.log(`[WEBHOOK] ✅ Ticket created: ${ticketId}`);
+      } else {
+        console.log(`[WEBHOOK] ❌ Payment failed: ${reference}`);
+      }
+    });
 
     res.sendStatus(200);
   } catch (err) {
@@ -129,7 +183,7 @@ app.post("/webhook", async (req, res) => {
 });
 
 /* ---------------------------------------------------
-   PAYMENT SUCCESS (GET) - User redirect page
+   PAYMENT SUCCESS (USER REDIRECT)
 --------------------------------------------------- */
 app.get("/payment-success", async (req, res) => {
   const reference = req.query.reference || req.query.tx_ref;
@@ -146,40 +200,35 @@ app.get("/payment-success", async (req, res) => {
       res.send(`
         <html>
           <head><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
-          <body style="font-family: Arial; text-align: center; padding: 50px; background: #f5f5f5;">
-            <div style="max-width: 400px; margin: 0 auto; background: white; padding: 40px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
-              <div style="font-size: 60px; color: #4caf50; margin-bottom: 20px;">✓</div>
-              <h2 style="color: #4caf50; margin-top: 0;">Payment Successful!</h2>
-              <p style="color: #666;">Your ticket has been generated.</p>
-              <p style="color: #999; font-size: 14px;">Ref: ${reference}</p>
-              <button onclick="window.close()" style="margin-top: 20px; padding: 12px 24px; background: #4caf50; color: white; border: none; border-radius: 5px; cursor: pointer;">Close</button>
-            </div>
+          <body style="font-family: Arial; text-align:center; padding:40px;">
+            <h2 style="color:green;">✅ Payment Successful</h2>
+            <p>Your ticket has been generated.</p>
+            <p style="color:#999;">Ref: ${reference}</p>
+            <button onclick="window.close()">Close</button>
           </body>
         </html>
       `);
     } else {
-      // Auto-refresh page every 3 seconds until payment is processed
       res.send(`
         <html>
           <head>
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <meta http-equiv="refresh" content="3">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
           </head>
-          <body style="text-align: center; padding: 50px;">
-            <h2>⏳ Processing...</h2>
-            <p>Checking payment status...</p>
-            <p style="color: #999;">Ref: ${reference}</p>
+          <body style="text-align:center; padding:40px;">
+            <h2>⏳ Processing payment...</h2>
+            <p>Ref: ${reference}</p>
           </body>
         </html>
       `);
     }
-  } catch (err) {
-    res.status(500).send("Server Error");
+  } catch {
+    res.status(500).send("Server error");
   }
 });
 
 /* ---------------------------------------------------
-   STATUS CHECK (for app polling)
+   STATUS CHECK
 --------------------------------------------------- */
 app.get("/payment-status/:id", async (req, res) => {
   try {
@@ -191,6 +240,9 @@ app.get("/payment-status/:id", async (req, res) => {
   }
 });
 
+/* ---------------------------------------------------
+   SERVER
+--------------------------------------------------- */
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log("🚀 Server running on port", PORT);
