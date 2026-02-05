@@ -139,7 +139,7 @@ app.post("/webhook", async (req, res) => {
       }
 
       const [eventId, ticketTypeId] = payment.itemId.split("_");
-      const eventRef = db.collection("events_balaka").doc(eventId);
+      const eventRef = db.collection("events").doc(eventId);
 
       // ✅ STEP 2: READ EVENT BEFORE ANY WRITES
       let eventName = "Event";
@@ -303,7 +303,7 @@ app.post("/scan-ticket", async (req, res) => {
 
       // ✅ MANAGER AUTHORIZATION CHECK
       // Get the event to verify the manager owns it
-      const eventRef = db.collection("events_balaka").doc(ticket.eventId);
+      const eventRef = db.collection("events").doc(ticket.eventId);
       const eventSnap = await transaction.get(eventRef);
 
       if (!eventSnap.exists) {
