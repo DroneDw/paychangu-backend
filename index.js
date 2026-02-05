@@ -289,6 +289,8 @@ app.post("/scan-ticket", async (req, res) => {
 
     console.log(`[SCAN] Attempting to scan: ${qrCode} by manager: ${scannerId}`);
 
+    let scanResult;
+
     await db.runTransaction(async (transaction) => {
       const ticketRef = db.collection("tickets").doc(qrCode);
       const ticketSnap = await transaction.get(ticketRef);
@@ -296,7 +298,8 @@ app.post("/scan-ticket", async (req, res) => {
       // Check if ticket exists
       if (!ticketSnap.exists) {
         console.log(`[SCAN] ❌ Ticket not found: ${qrCode}`);
-        return res.json({ success: false, message: "Invalid ticket - not found" });
+        scanResult = { success: false, message: "Invalid ticket - not found" };
+        return;
       }
 
       const ticket = ticketSnap.data();
@@ -308,56 +311,62 @@ app.post("/scan-ticket", async (req, res) => {
 
       if (!eventSnap.exists) {
         console.log(`[SCAN] ❌ Event not found for ticket: ${qrCode}`);
-        return res.json({ success: false, message: "Event not found for this ticket" });
+        scanResult = { success: false, message: "Event not found for this ticket" };
+        return;
       }
 
       const event = eventSnap.data();
-      
-      // To - check both organizerId and organiserIds array
+
+      // Check both organizerId and organiserIds array
       const isAuthorized =
           event.organizerId === scannerId ||
           (event.organiserIds && event.organiserIds.includes(scannerId));
 
       if (!isAuthorized) {
-          console.log(`[SCAN] ❌ User ${scannerId} not authorized for event ${ticket.eventId}`);
-          return res.json({ success: false, message: "You cannot scan tickets for this event" });
+        console.log(`[SCAN] ❌ User ${scannerId} not authorized for event ${ticket.eventId}`);
+        scanResult = { success: false, message: "You cannot scan tickets for this event" };
+        return;
       }
 
       // Check if already used
       if (ticket.status === "used") {
         console.log(`[SCAN] ⚠️ Already used: ${qrCode}`);
-        return res.json({
+        scanResult = {
           success: false,
-          message: `Ticket already used on ${ticket.usedAt?.toDate() || "unknown date"}`
-        });
+          message: `Ticket already used on ${ticket.usedAt?.toDate ? ticket.usedAt.toDate().toLocaleString() : "unknown date"}`
+        };
+        return;
       }
 
       // Check if ticket is active
       if (ticket.status !== "active") {
         console.log(`[SCAN] ❌ Ticket not active: ${qrCode}, status: ${ticket.status}`);
-        return res.json({ success: false, message: `Ticket status: ${ticket.status}` });
+        scanResult = { success: false, message: `Ticket status: ${ticket.status}` };
+        return;
       }
 
       // ✅ VALID - Mark as used
       transaction.update(ticketRef, {
         status: "used",
         scannedAt: admin.firestore.FieldValue.serverTimestamp(),
-        scannedBy: scannerId || "organizer" // track who scanned
+        scannedBy: scannerId || "organizer"
       });
 
       console.log(`[SCAN] ✅ Valid ticket scanned: ${qrCode} for ${ticket.eventName}`);
-      return res.json({
+      scanResult = {
         success: true,
         message: `Valid: ${ticket.ticketTypeName} - ${ticket.eventName}`
-      });
+      };
     });
+
+    // ✅ Send response ONCE after transaction completes
+    res.json(scanResult);
 
   } catch (err) {
     console.error("[SCAN ERROR]", err);
     res.status(500).json({ success: false, message: "Server error during scan" });
   }
 });
-
 /* ---------------------------------------------------
    SERVER
 --------------------------------------------------- */
