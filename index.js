@@ -312,11 +312,15 @@ app.post("/scan-ticket", async (req, res) => {
       }
 
       const event = eventSnap.data();
+      
+      // To - check both organizerId and organiserIds array
+      const isAuthorized =
+          event.organizerId === scannerId ||
+          (event.organiserIds && event.organiserIds.includes(scannerId));
 
-      // Verify that the scanner is the manager of this event
-      if (event.managerId !== scannerId) {
-        console.log(`[SCAN] ❌ Manager ${scannerId} not authorized for event ${ticket.eventId} (owned by ${event.managerId})`);
-        return res.json({ success: false, message: "You cannot scan tickets for this event" });
+      if (!isAuthorized) {
+          console.log(`[SCAN] ❌ User ${scannerId} not authorized for event ${ticket.eventId}`);
+          return res.json({ success: false, message: "You cannot scan tickets for this event" });
       }
 
       // Check if already used
