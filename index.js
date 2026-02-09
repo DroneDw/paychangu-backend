@@ -25,6 +25,17 @@ app.use(
 app.use(cors());
 
 /* ---------------------------------------------------
+   HEALTH CHECK (For Server Warm-up)
+--------------------------------------------------- */
+app.get("/health", (req, res) => {
+  res.json({
+    status: "ok",
+    timestamp: new Date().toISOString(),
+    service: "paychangu-backend"
+  });
+});
+
+/* ---------------------------------------------------
    PAY INIT
 --------------------------------------------------- */
 app.post("/pay", async (req, res) => {
