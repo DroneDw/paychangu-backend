@@ -50,14 +50,14 @@ app.post("/pay", async (req, res) => {
     console.log(`[PAY] Creating payment ${paymentRef}`);
 
     const payResponse = await axios.post(
-      "https://api.paychangu.com/payment   ",
+      "https://api.paychangu.com/payment ",
       {
         amount,
         currency: "MWK",
         phone_number: phone,
         network,
         reference: paymentRef,
-        callback_url: "https://paychangu-backend-g9vt.onrender.com/payment-success   ",
+        callback_url: "https://paychangu-backend-g9vt.onrender.com/payment-success ",
 
         // ✅ SINGLE SOURCE OF TRUTH
         meta: {
@@ -146,6 +146,16 @@ app.post("/webhook", async (req, res) => {
 
       if (payment.ticketCreated) {
         console.log(`[WEBHOOK] ℹ️ Already processed: ${paymentRef}`);
+        return;
+      }
+
+      // ✅ FIX: Only create ticket if payment is SUCCESS
+      if (status !== "SUCCESS") {
+        transaction.update(paymentDoc, {
+          status,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+        console.log(`[WEBHOOK] ℹ️ Payment failed or not successful: ${paymentRef}, status: ${status}`);
         return;
       }
 
