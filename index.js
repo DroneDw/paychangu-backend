@@ -13,40 +13,27 @@ const app = express();
 /* ---------------------------------------------------
    MIDDLEWARE
 --------------------------------------------------- */
+
+// Capture RAW body for webhook signature verification
 app.use(
   express.json({
     verify: (req, res, buf) => {
       req.rawBody = buf.toString();
-    },
+    }
   })
 );
 
 app.use(cors());
 
-// Webhook signature verification (kept for POST but not used for GET)
-function verifyWebhookSignature(req) {
-  const signature = req.headers["x-paychangu-signature"];
-  const secret = process.env.PAYCHANGU_WEBHOOK_SECRET;
-
-  if (!signature || !secret) return false;
-
-  const hash = crypto
-    .createHmac("sha256", secret)
-    .update(req.rawBody)
-    .digest("hex");
-
-  return signature === hash;
-}
-
 /* ---------------------------------------------------
-   HEALTH CHECK
+   HEALTH CHECK (For Server Warm-up)
 --------------------------------------------------- */
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
     timestamp: new Date().toISOString(),
     service: "paychangu-backend",
-    projects: ["dride", "campus-bike-rental"],
+    projects: ["dride", "campus-bike-rental"]
   });
 });
 
@@ -115,7 +102,7 @@ app.post("/pay", async (req, res) => {
       paymentData.rentalCreated = false;
       await dbNew.collection("payments").doc(paymentRef).set(paymentData);
     } else {
-      // OLD Firestore for event tickets
+      // OLD Firestore for event tickets - EXACTLY as your working code
       paymentData.ticketCreated = false;
       await db.collection("payments").doc(paymentRef).set(paymentData);
     }
@@ -129,91 +116,41 @@ app.post("/pay", async (req, res) => {
 });
 
 /* ---------------------------------------------------
-   WEBHOOK - GET handler for PayChangu (NEW)
---------------------------------------------------- */
-app.get("/webhook", async (req, res) => {
-  console.log("[WEBHOOK GET] Received");
-  
-  try {
-    // PayChangu sends data as query parameters
-    const { status, reference, meta } = req.query;
-    
-    console.log("[WEBHOOK GET] Query:", req.query);
-    
-    if (!reference) {
-      console.error("[WEBHOOK GET] No reference provided");
-      return res.sendStatus(400);
-    }
-    
-    // Parse meta if it's a string
-    let metaData = meta;
-    if (typeof meta === "string") {
-      try {
-        metaData = JSON.parse(meta);
-      } catch (e) {
-        // If can't parse, create minimal meta from reference
-        metaData = { paymentRef: reference, projectType: "event_ticket" };
-      }
-    }
-    
-    const paymentRef = metaData?.paymentRef || reference;
-    const projectType = metaData?.projectType || "event_ticket";
-    
-    console.log(`[WEBHOOK GET] paymentRef=${paymentRef}, project=${projectType}, status=${status}`);
-    
-    // Route to correct handler
-    if (projectType === "bike_rental") {
-      await handleBikeRentalWebhook(paymentRef, status === "success" ? "SUCCESS" : "FAILED", metaData);
-    } else {
-      await handleEventTicketWebhook(paymentRef, status === "success" ? "SUCCESS" : "FAILED", metaData);
-    }
-    
-    res.sendStatus(200);
-  } catch (err) {
-    console.error("[WEBHOOK GET ERROR]", err);
-    res.sendStatus(500);
-  }
-});
-
-/* ---------------------------------------------------
-   WEBHOOK - POST handler (kept for backward compatibility)
+   WEBHOOK - Handles BOTH projects
 --------------------------------------------------- */
 app.post("/webhook", async (req, res) => {
-  console.log("[WEBHOOK POST] Received");
-
-  // Skip signature verification for now since PayChangu uses GET
-  // if (!verifyWebhookSignature(req)) {
-  //   console.error("[WEBHOOK] Invalid signature");
-  //   return res.sendStatus(401);
-  // }
+  console.log("[WEBHOOK] Received");
 
   try {
     const payload = req.body;
-    console.log("[WEBHOOK POST] Payload:", JSON.stringify(payload, null, 2));
+    console.log("[WEBHOOK] Payload:", JSON.stringify(payload, null, 2));
 
+    // ✅ SAFELY PARSE META
     let meta = payload.meta;
 
     if (typeof meta === "string") {
       try {
         meta = JSON.parse(meta);
+        console.log("[WEBHOOK] Parsed meta:", meta);
       } catch (e) {
-        console.error("[WEBHOOK POST] Failed to parse meta");
+        console.error("[WEBHOOK] ❌ Failed to parse meta string");
         return res.sendStatus(400);
       }
     }
 
     const paymentRef = meta?.paymentRef;
-    const projectType = meta?.projectType || "event_ticket";
+    const projectType = meta?.projectType || "event_ticket"; // Default to old project
 
     if (!paymentRef) {
-      console.error("[WEBHOOK POST] paymentRef missing");
+      console.error("[WEBHOOK] ❌ paymentRef missing after parsing meta");
       return res.sendStatus(400);
     }
 
     const status = payload.status === "success" ? "SUCCESS" : "FAILED";
-    console.log(`[WEBHOOK POST] paymentRef=${paymentRef} project=${projectType} status=${status}`);
 
-    // Route to correct handler
+    console.log(`[WEBHOOK] paymentRef=${paymentRef} project=${projectType} status=${status}`);
+
+    // Route to correct handler based on project type
     if (projectType === "bike_rental") {
       await handleBikeRentalWebhook(paymentRef, status, meta);
     } else {
@@ -222,7 +159,7 @@ app.post("/webhook", async (req, res) => {
 
     res.sendStatus(200);
   } catch (err) {
-    console.error("[WEBHOOK POST ERROR]", err);
+    console.error("[WEBHOOK ERROR]", err);
     res.sendStatus(500);
   }
 });
@@ -247,9 +184,10 @@ async function handleBikeRentalWebhook(paymentRef, status, meta) {
       return;
     }
 
+    // Use admin.firestore.FieldValue for timestamp (works for both databases)
     transaction.update(paymentDoc, {
       status,
-      updatedAt: adminNew.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
     if (status === "SUCCESS") {
@@ -262,8 +200,8 @@ async function handleBikeRentalWebhook(paymentRef, status, meta) {
       const bikeDoc = await transaction.get(dbNew.collection("bikes").doc(bikeId));
       const bike = bikeDoc.exists ? bikeDoc.data() : null;
 
-      const now = adminNew.firestore.Timestamp.now();
-      const expectedReturn = new adminNew.firestore.Timestamp(
+      const now = admin.firestore.Timestamp.now();
+      const expectedReturn = new admin.firestore.Timestamp(
         now.seconds + durationHours * 3600,
         now.nanoseconds
       );
@@ -306,36 +244,41 @@ async function handleBikeRentalWebhook(paymentRef, status, meta) {
 
 /* ---------------------------------------------------
    HANDLE EVENT TICKET WEBHOOK (OLD FIRESTORE)
+   EXACTLY as your working code - unchanged logic
 --------------------------------------------------- */
 async function handleEventTicketWebhook(paymentRef, status, meta) {
   await db.runTransaction(async (transaction) => {
     const paymentDoc = db.collection("payments").doc(paymentRef);
+
+    // ✅ STEP 1: READ PAYMENT FIRST
     const snap = await transaction.get(paymentDoc);
 
     if (!snap.exists) {
-      console.error(`[WEBHOOK EVENT] Payment not found: ${paymentRef}`);
+      console.error(`[WEBHOOK] ❌ Payment not found: ${paymentRef}`);
       return;
     }
 
     const payment = snap.data();
 
     if (payment.ticketCreated) {
-      console.log(`[WEBHOOK EVENT] Already processed: ${paymentRef}`);
+      console.log(`[WEBHOOK] ℹ️ Already processed: ${paymentRef}`);
       return;
     }
 
+    // ✅ FIX: Only create ticket if payment is SUCCESS
     if (status !== "SUCCESS") {
       transaction.update(paymentDoc, {
         status,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
       });
-      console.log(`[WEBHOOK EVENT] Payment failed: ${paymentRef}`);
+      console.log(`[WEBHOOK] ℹ️ Payment failed or not successful: ${paymentRef}, status: ${status}`);
       return;
     }
 
     const [eventId, ticketTypeId] = payment.itemId.split("_");
     const eventRef = db.collection("events").doc(eventId);
 
+    // ✅ STEP 2: READ EVENT BEFORE ANY WRITES
     let eventName = "Event";
     let ticketTypeName = "Ticket";
     let updatedTicketTypes = null;
@@ -346,77 +289,86 @@ async function handleEventTicketWebhook(paymentRef, status, meta) {
         const eventData = eventSnap.data();
         eventName = eventData?.title || eventData?.name || "Event";
 
+        // Find ticket type and calculate new availability
         const ticketTypes = eventData?.ticketTypes || [];
-        const ticketTypeIndex = ticketTypes.findIndex((t) => t.id === ticketTypeId);
+        const ticketTypeIndex = ticketTypes.findIndex(t => t.id === ticketTypeId);
 
         if (ticketTypeIndex !== -1) {
           const ticketType = ticketTypes[ticketTypeIndex];
           ticketTypeName = ticketType.name || "Ticket";
 
+          // Calculate new counts
           const currentSold = ticketType.sold || 0;
           const currentQty = ticketType.quantity || 0;
           const newSold = currentSold + 1;
           const newAvailable = Math.max(0, currentQty - newSold);
 
+          // Prepare updated array
           updatedTicketTypes = [...ticketTypes];
           updatedTicketTypes[ticketTypeIndex] = {
             ...ticketType,
             sold: newSold,
-            available: newAvailable,
+            available: newAvailable
           };
+
+          console.log(`[WEBHOOK] Will update ${ticketTypeName}: sold=${newSold}, available=${newAvailable}`);
         }
       }
     } catch (e) {
-      console.log("[WEBHOOK EVENT] Could not fetch event details");
+      console.log("[WEBHOOK] Could not fetch event details, using defaults");
     }
 
     const ticketId = `TICKET_${paymentRef}`;
 
+    // ✅ STEP 3: ALL WRITES (NO READS AFTER THIS POINT)
+
     transaction.update(paymentDoc, {
       status,
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
     transaction.set(db.collection("tickets").doc(ticketId), {
       id: ticketId,
       userId: payment.userId,
       eventId,
-      eventName,
+      eventName,        // ✅ Human-readable event name
       ticketTypeId,
-      ticketTypeName,
+      ticketTypeName,   // ✅ Human-readable ticket type name
       paymentId: paymentRef,
       status: "active",
       qrCode: ticketId,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
     transaction.update(paymentDoc, { ticketCreated: true });
 
+    // Update event ticket counts if found
     if (updatedTicketTypes) {
       transaction.update(eventRef, {
-        ticketTypes: updatedTicketTypes,
+        ticketTypes: updatedTicketTypes
       });
     }
 
-    console.log(`[WEBHOOK EVENT] Ticket created: ${ticketId}`);
+    console.log(`[WEBHOOK] ✅ Ticket created: ${ticketId} for ${eventName}`);
   });
 }
 
 /* ---------------------------------------------------
-   PAYMENT SUCCESS PAGE
+   PAYMENT SUCCESS PAGE - Checks both Firestores
 --------------------------------------------------- */
 app.get("/payment-success", async (req, res) => {
-  const reference = req.query.reference;
+  const reference = req.query.reference || req.query.tx_ref;
 
   if (!reference) {
-    return res.send("<h2>Invalid reference</h2>");
+    return res.send("<h2>❌ Invalid reference</h2>");
   }
 
   try {
-    // Check BOTH Firestores
+    // Check OLD Firestore first (event tickets)
     let snap = await db.collection("payments").doc(reference).get();
     let isNewProject = false;
 
+    // If not found, check NEW Firestore (bike rentals)
     if (!snap.exists) {
       snap = await dbNew.collection("payments").doc(reference).get();
       isNewProject = true;
@@ -437,26 +389,26 @@ app.get("/payment-success", async (req, res) => {
         ? "Your bike rental is confirmed!" 
         : "Your ticket has been generated.";
       
-      res.send(`
-        <html>
+      res.send(
+        `<html>
           <body style="font-family:Arial;text-align:center;padding:40px;">
-            <h2 style="color:green;">Payment Successful!</h2>
+            <h2 style="color:green;">✅ Payment Successful</h2>
             <p>${message}</p>
-            <p>Reference: ${reference}</p>
+            <p>Ref: ${reference}</p>
             <button onclick="window.close()">Close</button>
           </body>
-        </html>
-      `);
+        </html>`
+      );
     } else {
-      res.send(`
-        <html>
+      res.send(
+        `<html>
           <head><meta http-equiv="refresh" content="3"></head>
           <body style="text-align:center;padding:40px;">
-            <h2>Processing...</h2>
-            <p>Reference: ${reference}</p>
+            <h2>⏳ Processing...</h2>
+            <p>Ref: ${reference}</p>
           </body>
-        </html>
-      `);
+        </html>`
+      );
     }
   } catch {
     res.status(500).send("Server error");
@@ -493,7 +445,7 @@ app.get("/payment-status/:id", async (req, res) => {
 });
 
 /* ---------------------------------------------------
-   SCAN TICKET (OLD PROJECT - unchanged)
+   TICKET SCANNING (VALIDATION) - EXACTLY as your working code
 --------------------------------------------------- */
 app.post("/scan-ticket", async (req, res) => {
   try {
@@ -511,57 +463,73 @@ app.post("/scan-ticket", async (req, res) => {
       const ticketRef = db.collection("tickets").doc(qrCode);
       const ticketSnap = await transaction.get(ticketRef);
 
+      // Check if ticket exists
       if (!ticketSnap.exists) {
-        console.log(`[SCAN] Ticket not found: ${qrCode}`);
+        console.log(`[SCAN] ❌ Ticket not found: ${qrCode}`);
         scanResult = { success: false, message: "Invalid ticket - not found" };
         return;
       }
 
       const ticket = ticketSnap.data();
+
+      // ✅ MANAGER AUTHORIZATION CHECK
+      // Get the event to verify the manager owns it
       const eventRef = db.collection("events").doc(ticket.eventId);
       const eventSnap = await transaction.get(eventRef);
 
       if (!eventSnap.exists) {
+        console.log(`[SCAN] ❌ Event not found for ticket: ${qrCode}`);
         scanResult = { success: false, message: "Event not found for this ticket" };
         return;
       }
 
       const event = eventSnap.data();
+
+      // Check both organizerId and organiserIds array
       const isAuthorized =
-        event.organizerId === scannerId ||
-        (event.organiserIds && event.organiserIds.includes(scannerId));
+          event.organizerId === scannerId ||
+          (event.organiserIds && event.organiserIds.includes(scannerId));
 
       if (!isAuthorized) {
+        console.log(`[SCAN] ❌ User ${scannerId} not authorized for event ${ticket.eventId}`);
         scanResult = { success: false, message: "You cannot scan tickets for this event" };
         return;
       }
 
+      // Check if already used
       if (ticket.status === "used") {
+        console.log(`[SCAN] ⚠️ Already used: ${qrCode}`);
         scanResult = {
           success: false,
-          message: `Ticket already used on ${ticket.usedAt?.toDate ? ticket.usedAt.toDate().toLocaleString() : "unknown date"}`,
+          message: `Ticket already used on ${ticket.usedAt?.toDate ? ticket.usedAt.toDate().toLocaleString() : "unknown date"}`
         };
         return;
       }
 
+      // Check if ticket is active
       if (ticket.status !== "active") {
+        console.log(`[SCAN] ❌ Ticket not active: ${qrCode}, status: ${ticket.status}`);
         scanResult = { success: false, message: `Ticket status: ${ticket.status}` };
         return;
       }
 
+      // ✅ VALID - Mark as used
       transaction.update(ticketRef, {
         status: "used",
         scannedAt: admin.firestore.FieldValue.serverTimestamp(),
-        scannedBy: scannerId || "organizer",
+        scannedBy: scannerId || "organizer"
       });
 
+      console.log(`[SCAN] ✅ Valid ticket scanned: ${qrCode} for ${ticket.eventName}`);
       scanResult = {
         success: true,
-        message: `Valid: ${ticket.ticketTypeName} - ${ticket.eventName}`,
+        message: `Valid: ${ticket.ticketTypeName} - ${ticket.eventName}`
       };
     });
 
+    // ✅ Send response ONCE after transaction completes
     res.json(scanResult);
+
   } catch (err) {
     console.error("[SCAN ERROR]", err);
     res.status(500).json({ success: false, message: "Server error during scan" });
