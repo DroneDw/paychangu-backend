@@ -1,7 +1,10 @@
 import admin from "firebase-admin";
+import { readFileSync } from "fs";
 
-// Read service account from environment variable
-const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_NEW);
+// Read from secret file (Render stores secret files in /etc/secrets/)
+const serviceAccount = JSON.parse(
+  readFileSync("/etc/secrets/serviceAccountKeyNew.json", "utf8")
+);
 
 const newApp = admin.initializeApp(
   {
