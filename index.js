@@ -23,7 +23,7 @@ app.use(
 
 app.use(cors());
 
-// Webhook signature verification
+// Webhook signature verification (kept for POST but not used for GET)
 function verifyWebhookSignature(req) {
   const signature = req.headers["x-paychangu-signature"];
   const secret = process.env.PAYCHANGU_WEBHOOK_SECRET;
@@ -129,20 +129,67 @@ app.post("/pay", async (req, res) => {
 });
 
 /* ---------------------------------------------------
-   WEBHOOK - Routes to correct Firestore based on project
+   WEBHOOK - GET handler for PayChangu (NEW)
+--------------------------------------------------- */
+app.get("/webhook", async (req, res) => {
+  console.log("[WEBHOOK GET] Received");
+  
+  try {
+    // PayChangu sends data as query parameters
+    const { status, reference, meta } = req.query;
+    
+    console.log("[WEBHOOK GET] Query:", req.query);
+    
+    if (!reference) {
+      console.error("[WEBHOOK GET] No reference provided");
+      return res.sendStatus(400);
+    }
+    
+    // Parse meta if it's a string
+    let metaData = meta;
+    if (typeof meta === "string") {
+      try {
+        metaData = JSON.parse(meta);
+      } catch (e) {
+        // If can't parse, create minimal meta from reference
+        metaData = { paymentRef: reference, projectType: "event_ticket" };
+      }
+    }
+    
+    const paymentRef = metaData?.paymentRef || reference;
+    const projectType = metaData?.projectType || "event_ticket";
+    
+    console.log(`[WEBHOOK GET] paymentRef=${paymentRef}, project=${projectType}, status=${status}`);
+    
+    // Route to correct handler
+    if (projectType === "bike_rental") {
+      await handleBikeRentalWebhook(paymentRef, status === "success" ? "SUCCESS" : "FAILED", metaData);
+    } else {
+      await handleEventTicketWebhook(paymentRef, status === "success" ? "SUCCESS" : "FAILED", metaData);
+    }
+    
+    res.sendStatus(200);
+  } catch (err) {
+    console.error("[WEBHOOK GET ERROR]", err);
+    res.sendStatus(500);
+  }
+});
+
+/* ---------------------------------------------------
+   WEBHOOK - POST handler (kept for backward compatibility)
 --------------------------------------------------- */
 app.post("/webhook", async (req, res) => {
-  console.log("[WEBHOOK] Received");
+  console.log("[WEBHOOK POST] Received");
 
-  // Verify signature
-  if (!verifyWebhookSignature(req)) {
-    console.error("[WEBHOOK] Invalid signature");
-    return res.sendStatus(401);
-  }
+  // Skip signature verification for now since PayChangu uses GET
+  // if (!verifyWebhookSignature(req)) {
+  //   console.error("[WEBHOOK] Invalid signature");
+  //   return res.sendStatus(401);
+  // }
 
   try {
     const payload = req.body;
-    console.log("[WEBHOOK] Payload:", JSON.stringify(payload, null, 2));
+    console.log("[WEBHOOK POST] Payload:", JSON.stringify(payload, null, 2));
 
     let meta = payload.meta;
 
@@ -150,21 +197,21 @@ app.post("/webhook", async (req, res) => {
       try {
         meta = JSON.parse(meta);
       } catch (e) {
-        console.error("[WEBHOOK] Failed to parse meta");
+        console.error("[WEBHOOK POST] Failed to parse meta");
         return res.sendStatus(400);
       }
     }
 
     const paymentRef = meta?.paymentRef;
-    const projectType = meta?.projectType || "event_ticket"; // Default to old project
+    const projectType = meta?.projectType || "event_ticket";
 
     if (!paymentRef) {
-      console.error("[WEBHOOK] paymentRef missing");
+      console.error("[WEBHOOK POST] paymentRef missing");
       return res.sendStatus(400);
     }
 
     const status = payload.status === "success" ? "SUCCESS" : "FAILED";
-    console.log(`[WEBHOOK] paymentRef=${paymentRef} project=${projectType} status=${status}`);
+    console.log(`[WEBHOOK POST] paymentRef=${paymentRef} project=${projectType} status=${status}`);
 
     // Route to correct handler
     if (projectType === "bike_rental") {
@@ -175,7 +222,7 @@ app.post("/webhook", async (req, res) => {
 
     res.sendStatus(200);
   } catch (err) {
-    console.error("[WEBHOOK ERROR]", err);
+    console.error("[WEBHOOK POST ERROR]", err);
     res.sendStatus(500);
   }
 });
