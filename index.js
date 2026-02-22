@@ -64,12 +64,20 @@ app.post("/pay", async (req, res) => {
         reference: paymentRef,
         callback_url: `${process.env.BACKEND_URL}/webhook`,
         return_url: `${process.env.BACKEND_URL}/payment-success?reference=${paymentRef}`,
-        meta: {
-          paymentRef,
-          userId,
-          itemId,
-          projectType: isBikeRental ? "bike_rental" : "event_ticket",
-        },
+        meta: isBikeRental
+          ? {
+              paymentRef,
+              userId,
+              projectType: "bike_rental",
+              bikeId: itemId.split("*").slice(0,2).join("*"),
+              duration: parseInt(itemId.split("_")[2]) || 1
+            }
+          : {
+              paymentRef,
+              userId,
+              itemId,
+              projectType: "event_ticket"
+            },
       },
       {
         headers: {
@@ -183,10 +191,13 @@ async function handleBikeRentalWebhook(paymentRef, status, meta) {
     return;
   }
   
-  // Parse bike info from itemId
-  const parts = payment.itemId.split("_");
-  const bikeId = parts[1];
-  const durationHours = parseInt(parts[2]) || 1;
+  const bikeId = meta?.bikeId;
+  const durationHours = meta?.duration || 1;
+  
+  if (!bikeId) {
+    console.error("[WEBHOOK BIKE] Missing bikeId in metadata");
+    return;
+  }
   
   // Get bike data outside transaction
   const bikeSnap = await dbNew.collection("bikes").doc(bikeId).get();
