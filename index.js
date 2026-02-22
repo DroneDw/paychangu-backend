@@ -168,23 +168,44 @@ app.post("/webhook", async (req, res) => {
    HANDLE BIKE RENTAL WEBHOOK (NEW FIRESTORE)
 --------------------------------------------------- */
 async function handleBikeRentalWebhook(paymentRef, status, meta) {
+  // Get bike info OUTSIDE the transaction first
+  const paymentSnap = await dbNew.collection("payments").doc(paymentRef).get();
+  
+  if (!paymentSnap.exists) {
+    console.error(`[WEBHOOK BIKE] Payment not found: ${paymentRef}`);
+    return;
+  }
+  
+  const payment = paymentSnap.data();
+  
+  if (payment.rentalCreated) {
+    console.log(`[WEBHOOK BIKE] Already processed: ${paymentRef}`);
+    return;
+  }
+  
+  // Parse bike info from itemId
+  const parts = payment.itemId.split("_");
+  const bikeId = parts[1];
+  const durationHours = parseInt(parts[2]) || 1;
+  
+  // Get bike data outside transaction
+  const bikeSnap = await dbNew.collection("bikes").doc(bikeId).get();
+  const bike = bikeSnap.exists ? bikeSnap.data() : null;
+  
+  // Now run transaction with all data ready
   await dbNew.runTransaction(async (transaction) => {
     const paymentDoc = dbNew.collection("payments").doc(paymentRef);
+    
+    // Re-read payment inside transaction to ensure consistency
     const snap = await transaction.get(paymentDoc);
-
-    if (!snap.exists) {
-      console.error(`[WEBHOOK BIKE] Payment not found: ${paymentRef}`);
+    const currentPayment = snap.data();
+    
+    if (currentPayment.rentalCreated) {
+      console.log(`[WEBHOOK BIKE] Already processed (in transaction): ${paymentRef}`);
       return;
     }
 
-    const payment = snap.data();
-
-    if (payment.rentalCreated) {
-      console.log(`[WEBHOOK BIKE] Already processed: ${paymentRef}`);
-      return;
-    }
-
-    // Use admin.firestore.FieldValue for timestamp (works for both databases)
+    // Update payment status
     transaction.update(paymentDoc, {
       status,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -192,13 +213,6 @@ async function handleBikeRentalWebhook(paymentRef, status, meta) {
 
     if (status === "SUCCESS") {
       const rentalId = `RENTAL_${paymentRef}`;
-      const parts = payment.itemId.split("_");
-      const bikeId = parts[1];
-      const durationHours = parseInt(parts[2]) || 1;
-
-      // Get bike from NEW Firestore
-      const bikeDoc = await transaction.get(dbNew.collection("bikes").doc(bikeId));
-      const bike = bikeDoc.exists ? bikeDoc.data() : null;
 
       const now = admin.firestore.Timestamp.now();
       const expectedReturn = new admin.firestore.Timestamp(
