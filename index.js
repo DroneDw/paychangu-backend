@@ -69,7 +69,7 @@ app.post("/pay", async (req, res) => {
               paymentRef,
               userId,
               projectType: "bike_rental",
-              bikeId: itemId.split("*").slice(0,2).join("*"),
+              bikeId: itemId.split("_").slice(0,2).join("_"),
               duration: parseInt(itemId.split("_")[2]) || 1
             }
           : {
