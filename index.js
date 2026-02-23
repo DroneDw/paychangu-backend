@@ -49,10 +49,49 @@ app.post("/pay", async (req, res) => {
     }
 
     // Determine which project this is for
-    const isBikeRental = projectType === "bike_rental" || itemId.startsWith("BIKE_");
+    const isBikeRental = projectType === "bike_rental" || itemId.startsWith("BIKE_") || itemId.startsWith("EXTENSION_") || itemId.startsWith("LATE_FEE_");
     const paymentRef = crypto.randomUUID();
     
     console.log(`[PAY] Creating payment ${paymentRef} for ${isBikeRental ? 'bike_rental' : 'event_ticket'}`);
+
+    // Build metadata based on payment type
+    let meta;
+    if (itemId.startsWith("EXTENSION_")) {
+      // Parse: EXTENSION_{rentalId}_{hours}h
+      const parts = itemId.split("_");
+      const hours = parseInt(parts[parts.length - 1].replace("h", ""));
+      const rentalId = parts.slice(1, parts.length - 1).join("_");
+      
+      meta = {
+        paymentRef,
+        userId,
+        projectType: "bike_rental",
+        paymentType: "extension",
+        rentalId: rentalId,
+        hours: hours
+      };
+    } else if (itemId.startsWith("LATE_FEE_")) {
+      // Parse: LATE_FEE_{rentalId}
+      const rentalId = itemId.replace("LATE_FEE_", "");
+      
+      meta = {
+        paymentRef,
+        userId,
+        projectType: "bike_rental",
+        paymentType: "late_fee",
+        rentalId: rentalId
+      };
+    } else {
+      // Regular bike rental
+      meta = {
+        paymentRef,
+        userId,
+        projectType: "bike_rental",
+        paymentType: "new_rental",
+        bikeId: itemId.split("_").slice(0,2).join("_"),
+        duration: parseInt(itemId.split("_")[2]) || 1
+      };
+    }
 
     const payResponse = await axios.post(
       "https://api.paychangu.com/payment",
@@ -64,20 +103,7 @@ app.post("/pay", async (req, res) => {
         reference: paymentRef,
         callback_url: `${process.env.BACKEND_URL}/webhook`,
         return_url: `${process.env.BACKEND_URL}/payment-success?reference=${paymentRef}`,
-        meta: isBikeRental
-          ? {
-              paymentRef,
-              userId,
-              projectType: "bike_rental",
-              bikeId: itemId.split("_").slice(0,2).join("_"),
-              duration: parseInt(itemId.split("_")[2]) || 1
-            }
-          : {
-              paymentRef,
-              userId,
-              itemId,
-              projectType: "event_ticket"
-            },
+        meta: meta,
       },
       {
         headers: {
@@ -176,7 +202,11 @@ app.post("/webhook", async (req, res) => {
    HANDLE BIKE RENTAL WEBHOOK (NEW FIRESTORE)
 --------------------------------------------------- */
 async function handleBikeRentalWebhook(paymentRef, status, meta) {
-  // Get bike info OUTSIDE the transaction first
+  const paymentType = meta?.paymentType || "new_rental";
+  
+  console.log(`[WEBHOOK BIKE] Type: ${paymentType}, Ref: ${paymentRef}`);
+  
+  // Get payment doc
   const paymentSnap = await dbNew.collection("payments").doc(paymentRef).get();
   
   if (!paymentSnap.exists) {
@@ -191,6 +221,96 @@ async function handleBikeRentalWebhook(paymentRef, status, meta) {
     return;
   }
   
+  // Handle extension payment
+  if (paymentType === "extension") {
+    const rentalId = meta?.rentalId;
+    const hours = meta?.hours || 1;
+    
+    if (!rentalId) {
+      console.error("[WEBHOOK BIKE EXTENSION] Missing rentalId");
+      return;
+    }
+    
+    try {
+      const rentalRef = dbNew.collection("rentals").doc(rentalId);
+      const rentalSnap = await rentalRef.get();
+      
+      if (!rentalSnap.exists) {
+        console.error(`[WEBHOOK BIKE EXTENSION] Rental not found: ${rentalId}`);
+        return;
+      }
+      
+      const rentalData = rentalSnap.data();
+      const hourlyRate = rentalData.hourlyRate || 0;
+      const extensionAmount = payment.amount;
+      
+      // Calculate new expected return time
+      const currentExpected = rentalData.expectedReturnTime.toDate();
+      const newExpectedSeconds = Math.floor(currentExpected.getTime() / 1000) + (hours * 3600);
+      const newExpected = new admin.firestore.Timestamp(newExpectedSeconds, 0);
+      
+      // Update rental with extension
+      await rentalRef.update({
+        extendedHours: admin.firestore.FieldValue.increment(hours),
+        extensionAmount: admin.firestore.FieldValue.increment(extensionAmount),
+        expectedReturnTime: newExpected,
+        status: "active",
+        lastExtensionAt: admin.firestore.FieldValue.serverTimestamp(),
+        lastExtensionPaymentId: paymentRef
+      });
+      
+      // Update payment status
+      await dbNew.collection("payments").doc(paymentRef).update({
+        status: status,
+        rentalCreated: true,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+      
+      console.log(`[WEBHOOK BIKE EXTENSION] ✅ Extended rental ${rentalId} by ${hours} hours`);
+      return;
+      
+    } catch (extError) {
+      console.error("[WEBHOOK BIKE EXTENSION] Error:", extError);
+      return;
+    }
+  }
+  
+  // Handle late fee payment
+  if (paymentType === "late_fee") {
+    const rentalId = meta?.rentalId;
+    
+    if (!rentalId) {
+      console.error("[WEBHOOK BIKE LATE_FEE] Missing rentalId");
+      return;
+    }
+    
+    try {
+      const rentalRef = dbNew.collection("rentals").doc(rentalId);
+      
+      await rentalRef.update({
+        lateFeePaid: true,
+        lateFeeAmount: payment.amount,
+        lateFeePaymentId: paymentRef,
+        lateFeePaidAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+      
+      // Update payment status
+      await dbNew.collection("payments").doc(paymentRef).update({
+        status: status,
+        rentalCreated: true,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+      
+      console.log(`[WEBHOOK BIKE LATE_FEE] ✅ Marked late fee as paid for ${rentalId}`);
+      return;
+      
+    } catch (lfError) {
+      console.error("[WEBHOOK BIKE LATE_FEE] Error:", lfError);
+      return;
+    }
+  }
+  
+  // Handle new rental payment (existing logic)
   const bikeId = meta?.bikeId;
   const durationHours = meta?.duration || 1;
   
