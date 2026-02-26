@@ -310,7 +310,7 @@ async function handleBikeRentalWebhook(paymentRef, status, meta) {
     }
   }
   
-  // Handle new rental payment (existing logic)
+  // Handle NEW RENTAL payment
   const bikeId = meta?.bikeId;
   const durationHours = meta?.duration || 1;
   
@@ -319,10 +319,18 @@ async function handleBikeRentalWebhook(paymentRef, status, meta) {
     return;
   }
   
-  // Get bike data outside transaction
+  // Get bike data AND user data outside transaction
   const bikeSnap = await dbNew.collection("bikes").doc(bikeId).get();
   const bike = bikeSnap.exists ? bikeSnap.data() : null;
   
+  // ✅ NEW: Fetch user data for student verification fields
+  const userSnap = await dbNew.collection("users").doc(payment.userId).get();
+  const user = userSnap.exists ? userSnap.data() : null;
+  
+  const userName = user?.name || "";
+  const studentId = user?.studentId || "";
+  const studentIdPhotoUrl = user?.studentIdPhotoUrl || "";
+
   // Now run transaction with all data ready
   await dbNew.runTransaction(async (transaction) => {
     const paymentDoc = dbNew.collection("payments").doc(paymentRef);
@@ -346,43 +354,94 @@ async function handleBikeRentalWebhook(paymentRef, status, meta) {
       const rentalId = `RENTAL_${paymentRef}`;
 
       const now = admin.firestore.Timestamp.now();
-      const expectedReturn = new admin.firestore.Timestamp(
-        now.seconds + durationHours * 3600,
-        now.nanoseconds
-      );
+      
+      // ✅ CRITICAL: Calculate expected return time and pickup window
+      const expectedReturnSeconds = now.seconds + (durationHours * 3600);
+      const expectedReturn = new admin.firestore.Timestamp(expectedReturnSeconds, 0);
+      
+      // Pickup window ends when rental duration ends (same as expected return)
+      const pickupWindowEnds = expectedReturn;
 
-      // Create rental in NEW Firestore
-      transaction.set(dbNew.collection("rentals").doc(rentalId), {
+      // ✅ CRITICAL: Create COMPLETE rental document with ALL fields
+      // This matches your Kotlin FirebaseRepository.kt structure exactly
+      const rentalData = {
+        // Basic info
         id: rentalId,
         bikeId: bikeId,
         bikeName: bike?.name || "Unknown Bike",
         userId: payment.userId,
-        userName: "",
+        userName: userName,
+        
+        // ✅ Student verification fields (for guard display)
+        studentId: studentId,
+        studentIdPhotoUrl: studentIdPhotoUrl,
+        studentName: userName,
+        
+        // Rental details
         durationHours: durationHours,
+        originalDuration: durationHours,  // Track original duration
         hourlyRate: bike?.hourlyRate || 0,
         totalAmount: payment.amount,
+        
+        // ✅ CRITICAL: Timing fields - ALL explicitly set
+        createdAt: now,
+        pickupWindowEnds: pickupWindowEnds,  // REQUIRED for auto-return logic
         startTime: now,
         expectedReturnTime: expectedReturn,
         actualReturnTime: null,
+        
+        // QR Code
         qrCode: rentalId,
-        status: "active",
+        status: "pending_pickup",  // ✅ FIXED: Start as pending_pickup, not active
+        
+        // Payment reference
+        paymentId: paymentRef,
+        createdAtServer: now,
+        
+        // ✅ CRITICAL: Pickup tracking fields - ALL explicitly set
+        qrScanned: false,              // EXPLICIT false - determines first scan
+        qrScannedAt: null,
+        qrCodeUsed: false,             // EXPLICIT false - anti-fraud
+        qrCodeUsedAt: null,
+        rentalTimeStarted: false,      // EXPLICIT false
+        rentalTimeStartedAt: null,
+        
+        // Guard actions - EXPLICIT empty/null
         releasedBy: "",
         returnedTo: "",
         releasedAt: null,
         returnedAt: null,
-        damageNotes: "",
-        paymentId: paymentRef,
-        createdAt: now,
-      });
+        
+        // Late fee tracking - EXPLICIT defaults
+        lateFeePaid: false,
+        lateFeeAmount: 0.0,
+        lateFeePaidAt: null,
+        finalLateFeeAmount: 0.0,
+        
+        // Extension tracking
+        extendedHours: 0,
+        extensionAmount: 0.0,
+        
+        // Auto-return tracking - EXPLICIT
+        autoReturned: false,           // EXPLICIT false
+        autoReturnedReason: "",
+        
+        // Damage
+        damageNotes: ""
+      };
 
-      // Update bike availability in NEW Firestore
+      // ✅ Create rental with ALL fields explicitly set
+      transaction.set(dbNew.collection("rentals").doc(rentalId), rentalData);
+
+      // Update bike availability
       transaction.update(dbNew.collection("bikes").doc(bikeId), {
         available: false,
       });
 
+      // Update payment
       transaction.update(paymentDoc, { rentalCreated: true });
 
-      console.log(`[WEBHOOK BIKE] Rental created: ${rentalId}`);
+      console.log(`[WEBHOOK BIKE] ✅ Rental created: ${rentalId} with status=pending_pickup, qrScanned=false`);
     }
   });
 }
