@@ -216,7 +216,7 @@ app.post("/webhook", async (req, res) => {
 });
 
 /* ---------------------------------------------------
-   HANDLE BUS BOOKING WEBHOOK (NEW FIRESTORE)
+   HANDLE BUS BOOKING WEBHOOK (NEW FIRESTORE) - FIXED
 --------------------------------------------------- */
 async function handleBusBookingWebhook(paymentRef, status, meta) {
   console.log(`[WEBHOOK BUS] Processing bus booking: ${paymentRef}`);
@@ -231,48 +231,61 @@ async function handleBusBookingWebhook(paymentRef, status, meta) {
   }
   
   try {
-    await dbNew.runTransaction(async (transaction) => {
-      const paymentDoc = dbNew.collection("payments").doc(paymentRef);
-      const paymentSnap = await transaction.get(paymentDoc);
-      
-      if (!paymentSnap.exists) {
-        console.error(`[WEBHOOK BUS] Payment not found: ${paymentRef}`);
-        return;
-      }
-      
-      const payment = paymentSnap.data();
-      
-      if (payment.ticketCreated) {
-        console.log(`[WEBHOOK BUS] Already processed: ${paymentRef}`);
-        return;
-      }
-      
-      // Update payment status
-      transaction.update(paymentDoc, {
+    // First, get the payment doc OUTSIDE the transaction to check if already processed
+    const paymentSnapOutside = await dbNew.collection("payments").doc(paymentRef).get();
+    
+    if (!paymentSnapOutside.exists) {
+      console.error(`[WEBHOOK BUS] Payment not found: ${paymentRef}`);
+      return;
+    }
+    
+    const paymentOutside = paymentSnapOutside.data();
+    
+    if (paymentOutside.ticketCreated) {
+      console.log(`[WEBHOOK BUS] Already processed: ${paymentRef}`);
+      return;
+    }
+
+    if (status !== "SUCCESS") {
+      // Just update status if not successful
+      await dbNew.collection("payments").doc(paymentRef).update({
         status: status,
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
+      console.log(`[WEBHOOK BUS] Payment not successful: ${status}`);
+      return;
+    }
+
+    // Get user data outside transaction
+    const userSnap = await dbNew.collection("users").doc(userId).get();
+    const userData = userSnap.exists ? userSnap.data() : {};
+
+    // Now run transaction with ALL reads first, then ALL writes
+    await dbNew.runTransaction(async (transaction) => {
+      // STEP 1: ALL READS FIRST
+      const paymentDoc = dbNew.collection("payments").doc(paymentRef);
+      const paymentSnap = await transaction.get(paymentDoc);
       
-      if (status !== "SUCCESS") {
-        console.log(`[WEBHOOK BUS] Payment not successful: ${status}`);
+      // Re-read payment inside transaction to ensure consistency
+      const payment = paymentSnap.data();
+      
+      if (payment.ticketCreated) {
+        console.log(`[WEBHOOK BUS] Already processed (in transaction): ${paymentRef}`);
         return;
       }
       
-      // Get bus data
+      // Get bus data - READ
       const busRef = dbNew.collection("bus_bookings").doc(busId);
       const busSnap = await transaction.get(busRef);
       
       if (!busSnap.exists) {
         console.error(`[WEBHOOK BUS] Bus not found: ${busId}`);
-        return;
+        throw new Error("Bus not found"); // Throw to abort transaction
       }
       
       const busData = busSnap.data();
       
-      // Get user data for ticket
-      const userRef = dbNew.collection("users").doc(userId);
-      const userSnap = await transaction.get(userRef);
-      const userData = userSnap.exists ? userSnap.data() : {};
+      // STEP 2: PROCESS DATA (no reads or writes here, just calculations)
       
       // Find and update the specific seat
       const seats = busData.seats || [];
@@ -280,7 +293,7 @@ async function handleBusBookingWebhook(paymentRef, status, meta) {
       
       if (seatIndex === -1) {
         console.error(`[WEBHOOK BUS] Seat ${seatNumber} not found on bus ${busId}`);
-        return;
+        throw new Error("Seat not found");
       }
       
       const seat = seats[seatIndex];
@@ -288,13 +301,13 @@ async function handleBusBookingWebhook(paymentRef, status, meta) {
       // Check if seat is already booked
       if (seat.status === "BOOKED") {
         console.error(`[WEBHOOK BUS] Seat ${seatNumber} already booked!`);
-        return;
+        throw new Error("Seat already booked");
       }
       
       // Generate ticket code
       const ticketCode = `BUS-${busId.substring(0, 8).toUpperCase()}-${seatNumber}-${Date.now().toString(36).toUpperCase()}`;
       
-      // Update seat in bus_bookings
+      // Prepare updated seats array
       const updatedSeats = [...seats];
       updatedSeats[seatIndex] = {
         ...seat,
@@ -307,12 +320,7 @@ async function handleBusBookingWebhook(paymentRef, status, meta) {
         price: payment.amount
       };
       
-      transaction.update(busRef, {
-        seats: updatedSeats,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp()
-      });
-      
-      // Create bus ticket
+      // Prepare ticket data
       const ticketId = `BUS_TICKET_${paymentRef}`;
       const ticketData = {
         id: ticketId,
@@ -356,6 +364,20 @@ async function handleBusBookingWebhook(paymentRef, status, meta) {
         qrData: ticketCode
       };
       
+      // STEP 3: ALL WRITES AFTER ALL READS
+      // Update payment status
+      transaction.update(paymentDoc, {
+        status: status,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      
+      // Update seat in bus_bookings
+      transaction.update(busRef, {
+        seats: updatedSeats,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+      
+      // Create bus ticket
       transaction.set(dbNew.collection("bus_tickets").doc(ticketId), ticketData);
       
       // Mark payment as processed
@@ -363,8 +385,11 @@ async function handleBusBookingWebhook(paymentRef, status, meta) {
       
       console.log(`[WEBHOOK BUS] ✅ Bus ticket created: ${ticketId}, Code: ${ticketCode}`);
     });
+    
   } catch (error) {
     console.error("[WEBHOOK BUS] Error:", error);
+    // Don't throw here to prevent webhook from retrying indefinitely
+    // But log the error for monitoring
   }
 }
 
