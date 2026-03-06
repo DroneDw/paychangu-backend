@@ -33,12 +33,12 @@ app.get("/health", (req, res) => {
     status: "ok",
     timestamp: new Date().toISOString(),
     service: "paychangu-backend",
-    projects: ["dride", "campus-bike-rental"]
+    projects: ["dride", "campus-bike-rental", "bus-booking"]
   });
 });
 
 /* ---------------------------------------------------
-   PAY INIT - Handles BOTH projects
+   PAY INIT - Handles ALL projects (Bike, Event, Bus)
 --------------------------------------------------- */
 app.post("/pay", async (req, res) => {
   try {
@@ -50,9 +50,10 @@ app.post("/pay", async (req, res) => {
 
     // Determine which project this is for
     const isBikeRental = projectType === "bike_rental" || itemId.startsWith("BIKE_") || itemId.startsWith("EXTENSION_") || itemId.startsWith("LATE_FEE_");
+    const isBusBooking = projectType === "bus_booking" || itemId.startsWith("BUS_");
     const paymentRef = crypto.randomUUID();
     
-    console.log(`[PAY] Creating payment ${paymentRef} for ${isBikeRental ? 'bike_rental' : 'event_ticket'}`);
+    console.log(`[PAY] Creating payment ${paymentRef} for ${isBikeRental ? 'bike_rental' : isBusBooking ? 'bus_booking' : 'event_ticket'}`);
 
     // Build metadata based on payment type
     let meta;
@@ -80,6 +81,20 @@ app.post("/pay", async (req, res) => {
         projectType: "bike_rental",
         paymentType: "late_fee",
         rentalId: rentalId
+      };
+    } else if (itemId.startsWith("BUS_")) {
+      // Parse: BUS_{busId}_SEAT_{seatNumber}
+      const parts = itemId.split("_");
+      const busId = parts[1];
+      const seatNumber = parts[3];
+      
+      meta = {
+        paymentRef,
+        userId,
+        projectType: "bus_booking",
+        busId: busId,
+        seatNumber: seatNumber,
+        itemId: itemId
       };
     } else {
       // Regular bike rental
@@ -127,21 +142,21 @@ app.post("/pay", async (req, res) => {
       phone,
       network,
       status: "PENDING",
-      projectType: isBikeRental ? "bike_rental" : "event_ticket",
+      projectType: isBikeRental ? "bike_rental" : isBusBooking ? "bus_booking" : "event_ticket",
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     };
 
-    if (isBikeRental) {
-      // NEW Firestore for bike rentals
-      paymentData.rentalCreated = false;
+    if (isBikeRental || isBusBooking) {
+      // NEW Firestore for bike rentals AND bus bookings
+      paymentData.ticketCreated = false; // Using same flag for simplicity
       await dbNew.collection("payments").doc(paymentRef).set(paymentData);
     } else {
-      // OLD Firestore for event tickets - EXACTLY as your working code
+      // OLD Firestore for event tickets
       paymentData.ticketCreated = false;
       await db.collection("payments").doc(paymentRef).set(paymentData);
     }
 
-    console.log(`[PAY] Stored payment ${paymentRef} in ${isBikeRental ? 'NEW' : 'OLD'} Firestore`);
+    console.log(`[PAY] Stored payment ${paymentRef} in ${isBikeRental || isBusBooking ? 'NEW' : 'OLD'} Firestore`);
     res.json({ paymentId: paymentRef, checkoutUrl });
   } catch (err) {
     console.error("[PAY ERROR]", err.response?.data || err.message);
@@ -150,7 +165,7 @@ app.post("/pay", async (req, res) => {
 });
 
 /* ---------------------------------------------------
-   WEBHOOK - Handles BOTH projects
+   WEBHOOK - Handles ALL projects
 --------------------------------------------------- */
 app.post("/webhook", async (req, res) => {
   console.log("[WEBHOOK] Received");
@@ -173,7 +188,7 @@ app.post("/webhook", async (req, res) => {
     }
 
     const paymentRef = meta?.paymentRef;
-    const projectType = meta?.projectType || "event_ticket"; // Default to old project
+    const projectType = meta?.projectType || "event_ticket";
 
     if (!paymentRef) {
       console.error("[WEBHOOK] ❌ paymentRef missing after parsing meta");
@@ -187,6 +202,8 @@ app.post("/webhook", async (req, res) => {
     // Route to correct handler based on project type
     if (projectType === "bike_rental") {
       await handleBikeRentalWebhook(paymentRef, status, meta);
+    } else if (projectType === "bus_booking") {
+      await handleBusBookingWebhook(paymentRef, status, meta);
     } else {
       await handleEventTicketWebhook(paymentRef, status, meta);
     }
@@ -197,6 +214,159 @@ app.post("/webhook", async (req, res) => {
     res.sendStatus(500);
   }
 });
+
+/* ---------------------------------------------------
+   HANDLE BUS BOOKING WEBHOOK (NEW FIRESTORE)
+--------------------------------------------------- */
+async function handleBusBookingWebhook(paymentRef, status, meta) {
+  console.log(`[WEBHOOK BUS] Processing bus booking: ${paymentRef}`);
+  
+  const busId = meta?.busId;
+  const seatNumber = meta?.seatNumber;
+  const userId = meta?.userId;
+  
+  if (!busId || !seatNumber || !userId) {
+    console.error("[WEBHOOK BUS] Missing required fields:", { busId, seatNumber, userId });
+    return;
+  }
+  
+  try {
+    await dbNew.runTransaction(async (transaction) => {
+      const paymentDoc = dbNew.collection("payments").doc(paymentRef);
+      const paymentSnap = await transaction.get(paymentDoc);
+      
+      if (!paymentSnap.exists) {
+        console.error(`[WEBHOOK BUS] Payment not found: ${paymentRef}`);
+        return;
+      }
+      
+      const payment = paymentSnap.data();
+      
+      if (payment.ticketCreated) {
+        console.log(`[WEBHOOK BUS] Already processed: ${paymentRef}`);
+        return;
+      }
+      
+      // Update payment status
+      transaction.update(paymentDoc, {
+        status: status,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      
+      if (status !== "SUCCESS") {
+        console.log(`[WEBHOOK BUS] Payment not successful: ${status}`);
+        return;
+      }
+      
+      // Get bus data
+      const busRef = dbNew.collection("bus_bookings").doc(busId);
+      const busSnap = await transaction.get(busRef);
+      
+      if (!busSnap.exists) {
+        console.error(`[WEBHOOK BUS] Bus not found: ${busId}`);
+        return;
+      }
+      
+      const busData = busSnap.data();
+      
+      // Get user data for ticket
+      const userRef = dbNew.collection("users").doc(userId);
+      const userSnap = await transaction.get(userRef);
+      const userData = userSnap.exists ? userSnap.data() : {};
+      
+      // Find and update the specific seat
+      const seats = busData.seats || [];
+      const seatIndex = seats.findIndex(s => s.seatNumber === seatNumber);
+      
+      if (seatIndex === -1) {
+        console.error(`[WEBHOOK BUS] Seat ${seatNumber} not found on bus ${busId}`);
+        return;
+      }
+      
+      const seat = seats[seatIndex];
+      
+      // Check if seat is already booked
+      if (seat.status === "BOOKED") {
+        console.error(`[WEBHOOK BUS] Seat ${seatNumber} already booked!`);
+        return;
+      }
+      
+      // Generate ticket code
+      const ticketCode = `BUS-${busId.substring(0, 8).toUpperCase()}-${seatNumber}-${Date.now().toString(36).toUpperCase()}`;
+      
+      // Update seat in bus_bookings
+      const updatedSeats = [...seats];
+      updatedSeats[seatIndex] = {
+        ...seat,
+        status: "BOOKED",
+        bookedBy: userId,
+        bookedByName: userData.name || "Unknown",
+        studentId: userData.studentId || "",
+        bookedAt: admin.firestore.FieldValue.serverTimestamp(),
+        ticketCode: ticketCode,
+        price: payment.amount
+      };
+      
+      transaction.update(busRef, {
+        seats: updatedSeats,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+      
+      // Create bus ticket
+      const ticketId = `BUS_TICKET_${paymentRef}`;
+      const ticketData = {
+        id: ticketId,
+        ticketCode: ticketCode,
+        busId: busId,
+        busName: busData.busName || "Unknown Bus",
+        busCompany: busData.busCompany || "",
+        busNumber: busData.busNumber || "",
+        seatNumber: seatNumber,
+        seatType: seat.type || "REGULAR",
+        
+        // Route info
+        fromLocation: busData.fromLocation || "",
+        toLocation: busData.toLocation || "",
+        departureDate: busData.departureDate || null,
+        departureTime: busData.departureTime || "",
+        arrivalTime: busData.arrivalTime || "",
+        
+        // Student info
+        studentId: userId,
+        studentName: userData.name || "",
+        studentPhone: userData.phone || "",
+        studentIdNumber: userData.studentId || "",
+        
+        // Organizer info
+        organizerId: busData.organizerId || "",
+        organizerName: busData.organizerName || "",
+        organizerPhone: busData.organizerPhone || "",
+        
+        // Payment info
+        bookingFee: payment.amount,
+        totalPrice: busData.totalPrice || payment.amount,
+        paymentId: paymentRef,
+        paidAt: admin.firestore.FieldValue.serverTimestamp(),
+        
+        // Status
+        status: "VALID", // VALID, USED, CANCELLED, EXPIRED
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        
+        // QR data
+        qrData: ticketCode
+      };
+      
+      transaction.set(dbNew.collection("bus_tickets").doc(ticketId), ticketData);
+      
+      // Mark payment as processed
+      transaction.update(paymentDoc, { ticketCreated: true });
+      
+      console.log(`[WEBHOOK BUS] ✅ Bus ticket created: ${ticketId}, Code: ${ticketCode}`);
+    });
+  } catch (error) {
+    console.error("[WEBHOOK BUS] Error:", error);
+  }
+}
 
 /* ---------------------------------------------------
    HANDLE BIKE RENTAL WEBHOOK (NEW FIRESTORE)
@@ -379,40 +549,40 @@ async function handleBikeRentalWebhook(paymentRef, status, meta) {
         
         // Rental details
         durationHours: durationHours,
-        originalDuration: durationHours,  // Track original duration
+        originalDuration: durationHours,
         hourlyRate: bike?.hourlyRate || 0,
         totalAmount: payment.amount,
         
         // ✅ CRITICAL: Timing fields - ALL explicitly set
         createdAt: now,
-        pickupWindowEnds: pickupWindowEnds,  // REQUIRED for auto-return logic
+        pickupWindowEnds: pickupWindowEnds,
         startTime: now,
         expectedReturnTime: expectedReturn,
         actualReturnTime: null,
         
         // QR Code
         qrCode: rentalId,
-        status: "pending_pickup",  // ✅ FIXED: Start as pending_pickup, not active
+        status: "pending_pickup",
         
         // Payment reference
         paymentId: paymentRef,
         createdAtServer: now,
         
-        // ✅ CRITICAL: Pickup tracking fields - ALL explicitly set
-        qrScanned: false,              // EXPLICIT false - determines first scan
+        // ✅ CRITICAL: Pickup tracking fields
+        qrScanned: false,
         qrScannedAt: null,
-        qrCodeUsed: false,             // EXPLICIT false - anti-fraud
+        qrCodeUsed: false,
         qrCodeUsedAt: null,
-        rentalTimeStarted: false,      // EXPLICIT false
+        rentalTimeStarted: false,
         rentalTimeStartedAt: null,
         
-        // Guard actions - EXPLICIT empty/null
+        // Guard actions
         releasedBy: "",
         returnedTo: "",
         releasedAt: null,
         returnedAt: null,
         
-        // Late fee tracking - EXPLICIT defaults
+        // Late fee tracking
         lateFeePaid: false,
         lateFeeAmount: 0.0,
         lateFeePaidAt: null,
@@ -422,8 +592,8 @@ async function handleBikeRentalWebhook(paymentRef, status, meta) {
         extendedHours: 0,
         extensionAmount: 0.0,
         
-        // Auto-return tracking - EXPLICIT
-        autoReturned: false,           // EXPLICIT false
+        // Auto-return tracking
+        autoReturned: false,
         autoReturnedReason: "",
         
         // Damage
@@ -535,9 +705,9 @@ async function handleEventTicketWebhook(paymentRef, status, meta) {
       id: ticketId,
       userId: payment.userId,
       eventId,
-      eventName,        // ✅ Human-readable event name
+      eventName,
       ticketTypeId,
-      ticketTypeName,   // ✅ Human-readable ticket type name
+      ticketTypeName,
       paymentId: paymentRef,
       status: "active",
       qrCode: ticketId,
@@ -570,12 +740,13 @@ app.get("/payment-success", async (req, res) => {
   try {
     // Check OLD Firestore first (event tickets)
     let snap = await db.collection("payments").doc(reference).get();
-    let isNewProject = false;
+    let projectType = "event_ticket";
 
-    // If not found, check NEW Firestore (bike rentals)
+    // If not found, check NEW Firestore (bike rentals & bus bookings)
     if (!snap.exists) {
       snap = await dbNew.collection("payments").doc(reference).get();
-      isNewProject = true;
+      const paymentData = snap.data();
+      projectType = paymentData?.projectType || "bike_rental";
     }
 
     const payment = snap.data();
@@ -589,9 +760,14 @@ app.get("/payment-success", async (req, res) => {
                       payment?.rentalCreated;
 
     if (isSuccess) {
-      const message = isNewProject 
-        ? "Your bike rental is confirmed!" 
-        : "Your ticket has been generated.";
+      let message;
+      if (projectType === "bus_booking") {
+        message = "Your bus seat is booked! Check your tickets.";
+      } else if (projectType === "bike_rental") {
+        message = "Your bike rental is confirmed!";
+      } else {
+        message = "Your ticket has been generated.";
+      }
       
       res.send(
         `<html>
@@ -741,11 +917,83 @@ app.post("/scan-ticket", async (req, res) => {
 });
 
 /* ---------------------------------------------------
+   BUS TICKET SCANNING (VALIDATION) - NEW
+--------------------------------------------------- */
+app.post("/scan-bus-ticket", async (req, res) => {
+  try {
+    const { ticketCode, scannerId } = req.body;
+
+    if (!ticketCode) {
+      return res.status(400).json({ success: false, message: "Ticket code required" });
+    }
+
+    console.log(`[SCAN BUS] Attempting to scan: ${ticketCode} by organizer: ${scannerId}`);
+
+    // Find ticket by code
+    const ticketsSnap = await dbNew.collection("bus_tickets")
+      .where("ticketCode", "==", ticketCode)
+      .limit(1)
+      .get();
+
+    if (ticketsSnap.empty) {
+      console.log(`[SCAN BUS] ❌ Ticket not found: ${ticketCode}`);
+      return res.json({ success: false, message: "Invalid ticket code" });
+    }
+
+    const ticketDoc = ticketsSnap.docs[0];
+    const ticket = ticketDoc.data();
+
+    // Check if organizer owns this bus
+    if (ticket.organizerId !== scannerId) {
+      console.log(`[SCAN BUS] ❌ Organizer ${scannerId} not authorized for bus ${ticket.busId}`);
+      return res.json({ success: false, message: "You can only scan tickets for your own buses" });
+    }
+
+    // Check ticket status
+    if (ticket.status === "USED") {
+      console.log(`[SCAN BUS] ⚠️ Already used: ${ticketCode}`);
+      return res.json({ 
+        success: false, 
+        message: `Ticket already used on ${ticket.usedAt?.toDate ? ticket.usedAt.toDate().toLocaleString() : "unknown date"}`
+      });
+    }
+
+    if (ticket.status !== "VALID") {
+      console.log(`[SCAN BUS] ❌ Ticket not valid: ${ticketCode}, status: ${ticket.status}`);
+      return res.json({ success: false, message: `Ticket status: ${ticket.status}` });
+    }
+
+    // Mark as used
+    await ticketDoc.ref.update({
+      status: "USED",
+      usedAt: admin.firestore.FieldValue.serverTimestamp(),
+      scannedBy: scannerId
+    });
+
+    console.log(`[SCAN BUS] ✅ Valid ticket scanned: ${ticketCode} for ${ticket.studentName}`);
+    res.json({
+      success: true,
+      message: `Valid ticket: Seat ${ticket.seatNumber} - ${ticket.studentName}`,
+      ticket: {
+        studentName: ticket.studentName,
+        seatNumber: ticket.seatNumber,
+        from: ticket.fromLocation,
+        to: ticket.toLocation
+      }
+    });
+
+  } catch (err) {
+    console.error("[SCAN BUS ERROR]", err);
+    res.status(500).json({ success: false, message: "Server error during scan" });
+  }
+});
+
+/* ---------------------------------------------------
    SERVER
 --------------------------------------------------- */
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
-  console.log("🚀 Dual Firestore Backend running on port", PORT);
+  console.log("🚀 Multi-Project Backend running on port", PORT);
   console.log("📦 Old Project: DroRide (Events/Tickets)");
-  console.log("📦 New Project: Campus Bike Rental (Bikes/Rentals)");
+  console.log("📦 New Project: Campus Bike Rental (Bikes/Rentals/Bus Bookings)");
 });
