@@ -315,7 +315,7 @@ async function handleBusBookingWebhook(paymentRef, status, meta) {
         bookedBy: userId,
         bookedByName: userData.name || "Unknown",
         studentId: userData.studentId || "",
-        bookedAt: admin.firestore.FieldValue.serverTimestamp(),
+        bookedAt: new Date(),
         ticketCode: ticketCode,
         price: payment.amount
       };
